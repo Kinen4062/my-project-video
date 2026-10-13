@@ -1,0 +1,1104 @@
+import os
+import shutil  # 用于复制文件
+
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+import cv2
+import torch
+import numpy as np
+from PIL import Image, ImageTk
+import threading
+import time
+from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+from ffpyplayer.player import MediaPlayer
+# ============ 深色主题配色 ============
+DARK_BG      = "#1e1e1e"   # 主背景
+DARK_BG2     = "#2b2b2b"   # 次级背景（面板、进度条槽）
+DARK_BG3     = "#3c3c3c"   # 控件背景（按钮、输入框）
+DARK_FG      = "#e0e0e0"   # 主文字
+DARK_FG2     = "#a0a0a0"   # 次要文字
+DARK_HL      = "#555555"   # 高亮 / hover
+DARK_ACCENT  = "#4a9eff"   # 强调色（进度、选中）
+# 普通按钮（深灰底 + 扁平）
+BTN_NORMAL = dict(
+    bg=DARK_BG3, fg=DARK_FG,
+    activebackground=DARK_HL, activeforeground=DARK_FG,
+    relief=tk.FLAT, bd=0, padx=8, pady=4,
+)
+
+# 危险按钮（红底，用于取消转换）
+BTN_DANGER = dict(
+    bg="#c0392b", fg="white",
+    activebackground="#e74c3c", activeforeground="white",
+    relief=tk.FLAT, bd=0, padx=10, pady=4,
+)
+
+# 主要行动按钮（橙底，用于转换）
+BTN_PRIMARY = dict(
+    bg="#e67e22", fg="white",
+    activebackground="#f39c12", activeforeground="white",
+    relief=tk.FLAT, bd=0, padx=8, pady=4,
+)
+
+# 成功按钮（绿底，用于导出）
+BTN_SUCCESS = dict(
+    bg="#27ae60", fg="white",
+    activebackground="#2ecc71", activeforeground="white",
+    relief=tk.FLAT, bd=0, padx=8, pady=4,
+)
+
+# 【P0 修复】空格键冲突控件清单
+# 这些控件自身就以空格键为原生操作（按钮被激活、输入框/列表输入空格等），
+# 焦点落在它们上面时，全局的"空格=播放/暂停"必须让路，
+# 否则一次按键会同时触发按钮动作和播放切换。
+SPACE_CONFLICT_WIDGETS = (
+    tk.Button, tk.Entry, tk.Text, tk.Listbox,
+    ttk.Button, ttk.Entry, ttk.Combobox,
+    ttk.Checkbutton, ttk.Radiobutton,
+)
+
+class VideoPlayerApp:
+    def __init__(self, root):
+        self.root = root
+        self.setup_dark_theme()
+        self.root.title("AI 3D 播放器 - 测试版")
+        self.root.geometry("950x700")
+
+        # --- 播放器状态 ---
+        self.cap = None
+        self.is_playing = False
+        self.is_paused = False
+        self.playback_speed = 1.0
+        self.is_fullscreen = False
+        self.is_converting = False
+
+        # --- 进度条核心变量 ---
+        self.total_frames = 0
+        self.current_frame = 0
+        self.video_fps = 30.0
+        self.is_seeking = False
+        self.seek_var = tk.DoubleVar()
+        self.seek_timer = None
+        self.current_frame_image = None
+        self.current_video_path = ""
+
+        # 【修复】用于防止定时器叠加导致视频加速
+        self.after_id = None
+
+        # 【新增】窗口缩放防抖用的定时器 ID
+        self.resize_after_id = None
+        self.is_resizing = False  # 【新增】窗口拖动中标志
+
+        self._hide_controls_id = None  # 全屏下自动隐藏底栏的定时器
+        self._controls_visible = True  # 当前底栏是否可见
+
+        # --- 3D 调节状态 ---
+        self.parallax_value = 0.0  # 视差偏移，正值增强 3D
+        self.swap_eyes = False  # 是否交换左右眼
+        self.current_raw_frame = None  # 保存未处理的 SBS 原始帧
+        self._mesh_hw = None  # remap 网格缓存
+        self._mesh_x = None
+        self._mesh_y = None
+
+        # --- 3D 显示模式变量 ---
+        self.display_mode = "2D"
+        self.mode_var = tk.StringVar(value="2D")
+
+        # --- AI 模型相关 ---
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model = None
+        self.image_processor = None
+
+        # ============================================================
+        # 【关键修复】顶层布局改用 grid
+        # ------------------------------------------------------------
+        # 原来的 pack 布局里，video_label 先打包并带 expand=True。
+        # 一旦贴上图片（尤其是切换 3D 模式后重绘），它的"请求尺寸"
+        # 会随图像变大，把后打包的底栏挤出可视区。
+        # 而 change_display_mode 里重新 pack 底栏时，又会把底栏挪到
+        # 打包顺序的更后面，于是彻底把按钮顶没了。
+        #
+        # grid 用 row weight 分配空间，第 0 行吸收所有额外空间，
+        # 第 1、2 行（进度条、按钮栏）高度固定，永远不会被挤掉。
+        # ============================================================
+        self.root.grid_rowconfigure(0, weight=1)   # 视频区吸收所有额外空间
+        self.root.grid_columnconfigure(0, weight=1)
+
+        # 【修复】用容器包住 video_label，防止视频图像"请求尺寸"撑大网格
+        self.video_container = tk.Frame(self.root, bg="black")
+        self.video_container.grid(row=0, column=0, sticky="nsew")
+        #self.video_container.grid_propagate(False)  # 容器尺寸由 grid 决定
+        #self.video_container.pack_propagate(False)  # 容器尺寸不被内部 Label 撑大
+
+        self.video_label = tk.Label(self.video_container, bg="black")
+        self.video_label.pack(fill=tk.BOTH, expand=True)
+        # 【关键】监听容器尺寸变化，底栏显隐/窗口缩放都会触发重绘
+        self.video_container.bind("<Configure>", self.on_window_resize)
+
+        self.progress_frame = tk.Frame(self.root, bg=DARK_BG)
+        self.progress_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=5)
+
+        self.scale = ttk.Scale(self.progress_frame, from_=0, to=100, orient=tk.HORIZONTAL,
+                               variable=self.seek_var, command=self.on_scale_move)
+        self.scale.pack(fill=tk.X)
+        self.scale.bind("<ButtonRelease-1>", self.on_scale_release)
+        self.scale.bind("<Button-1>", self.on_scale_click)
+
+        self.btn_frame = tk.Frame(self.root, bg=DARK_BG)
+        self.btn_frame.grid(row=2, column=0, sticky="ew")
+
+        # --- 转换进度控制 ---
+        self.conversion_cancel_event = threading.Event()
+
+        # 转换进度面板（默认隐藏，转换时出现）
+        self.conversion_frame = tk.Frame(self.root, bg=DARK_BG2)
+        self.conversion_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=5)
+        self.conversion_frame.grid_remove()  # 初始隐藏
+
+        self.conv_label = tk.Label(
+            self.conversion_frame, text="转换中: 0/0 (0%)",
+            bg=DARK_BG2, fg=DARK_FG, font=("Microsoft YaHei", 9)
+        )
+        self.conv_label.pack(side=tk.LEFT, padx=5)
+
+        self.conv_progress_var = tk.DoubleVar(value=0)
+        self.conv_progressbar = ttk.Progressbar(
+            self.conversion_frame,
+            variable=self.conv_progress_var,
+            maximum=100,
+            length=300
+        )
+        self.conv_progressbar.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+
+        self.btn_cancel_convert = tk.Button(
+            self.conversion_frame,
+            text="取消转换",
+            command=self.cancel_conversion,
+            **BTN_DANGER,
+        )
+        self.btn_cancel_convert.pack(side=tk.LEFT, padx=5)
+
+        # 音量控制
+        self.volume_label = tk.Label(self.btn_frame, text="音量:", bg=DARK_BG, fg=DARK_FG)
+        self.volume_label.pack(side=tk.LEFT, padx=(10, 5))
+
+        self.volume_var = tk.DoubleVar(value=1.0)
+        self.volume_scale = ttk.Scale(
+            self.btn_frame, from_=0.0, to=1.0,
+            variable=self.volume_var, orient=tk.HORIZONTAL,
+            length=80, command=self.change_volume
+        )
+        self.volume_scale.pack(side=tk.LEFT)
+
+        self.btn_mute = tk.Button(self.btn_frame, text="🔊", command=self.toggle_mute, **BTN_NORMAL)
+        self.btn_mute.pack(side=tk.LEFT, padx=5)
+
+        self.btn_open = tk.Button(self.btn_frame, text="打开已有3D视频", command=self.open_video, **BTN_NORMAL)
+        self.btn_open.pack(side=tk.LEFT, padx=5, pady=10)
+
+        self.btn_convert = tk.Button(self.btn_frame, text="导入2D视频一键转3D",
+                                     command=self.start_conversion, **BTN_PRIMARY)
+        self.btn_convert.pack(side=tk.LEFT, padx=5, pady=10)
+
+        self.btn_play = tk.Button(self.btn_frame, text="播放", command=self.toggle_play, **BTN_NORMAL)
+        self.btn_play.pack(side=tk.LEFT, padx=5, pady=10)
+
+        # --- 视差与左右眼控制栏 ---
+        self.parallax_frame = tk.Frame(self.root, bg=DARK_BG)
+        self.parallax_frame.grid(row=4, column=0, sticky="ew", padx=10, pady=2)
+
+        self.parallax_label = tk.Label(self.parallax_frame, text="视差: 0", bg=DARK_BG, fg=DARK_FG)
+        self.parallax_label.pack(side=tk.LEFT)
+
+        self.parallax_var = tk.DoubleVar(value=0)
+        self.parallax_scale = ttk.Scale(
+            self.parallax_frame, from_=-15, to=15,
+            variable=self.parallax_var, orient=tk.HORIZONTAL,
+            length=200, command=self.change_parallax
+        )
+        self.parallax_scale.pack(side=tk.LEFT, padx=5)
+
+        self.btn_swap_eyes = tk.Button(
+            self.parallax_frame, text="交换左右眼",
+            command=self.toggle_swap_eyes, **BTN_NORMAL,
+        )
+        self.btn_swap_eyes.pack(side=tk.LEFT, padx=5)
+
+        # 3D模式下拉框
+        self.mode_label = tk.Label(self.btn_frame, text="3D模式:", bg=DARK_BG, fg=DARK_FG)
+        self.mode_label.pack(side=tk.LEFT, padx=(10, 5))
+
+        self.mode_combo = ttk.Combobox(
+            self.btn_frame,
+            textvariable=self.mode_var,
+            values=["2D", "红蓝3D", "偏振-隔行", "偏振-隔列", "偏振-棋盘"],
+            width=10,
+            state="readonly"
+        )
+        self.mode_combo.pack(side=tk.LEFT)
+        self.mode_combo.bind("<<ComboboxSelected>>", self.change_display_mode)
+
+        self.btn_screenshot = tk.Button(self.btn_frame, text="截图", command=self.save_screenshot, **BTN_NORMAL)
+        self.btn_screenshot.pack(side=tk.LEFT, padx=5, pady=10)
+
+        # 导出3D视频按钮
+        self.btn_export = tk.Button(self.btn_frame, text="导出3D视频",
+                                    command=self.export_3d_video, **BTN_SUCCESS)
+        self.btn_export.pack(side=tk.LEFT, padx=5, pady=10)
+
+        self.speed_label = tk.Label(self.btn_frame, text="倍速:", bg=DARK_BG, fg=DARK_FG)
+        self.speed_label.pack(side=tk.LEFT, padx=(10, 5))
+        self.speed_var = tk.StringVar(value="1.0x")
+        self.speed_combo = ttk.Combobox(self.btn_frame, textvariable=self.speed_var,
+                                        values=["0.5x", "1.0x", "1.5x", "2.0x"], width=5, state="readonly")
+        self.speed_combo.pack(side=tk.LEFT)
+        self.speed_combo.bind("<<ComboboxSelected>>", self.change_speed)
+
+        self.root.bind("<space>", self._on_space_key)
+        self.root.bind("<F11>", self.toggle_fullscreen)
+
+        # 监听窗口尺寸变化，实现自适应填充
+        self.root.bind("<Configure>", self.on_window_resize)
+
+        # --- 音频播放状态 ---
+        self.audio_player = None  # ffpyplayer 的 MediaPlayer 实例
+        self.audio_volume = 1.0  # 音量 0.0 ~ 1.0
+        self.audio_muted = False  # 是否静音
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        self._hide_controls_id = None
+
+    # ============================================================
+    # 窗口尺寸变化 → 重新渲染当前帧（等比缩放填满 video_label）
+    # ============================================================
+    def on_window_resize(self, event=None):
+        # 只响应主窗口和 video_container 的事件
+        if event is not None and event.widget not in (self.root, self.video_container):
+            return
+
+        # 只有主窗口缩放才算"拖动中"，底栏显隐触发的容器变化按稳定态处理
+        is_root_resize = (event is None or event.widget is self.root)
+
+        if is_root_resize:
+            self.is_resizing = True
+            if self.current_frame_image is not None:
+                self.render_current_frame(fast=True)
+
+        # 防抖：底栏刚隐藏/显示时，容器尺寸可能要连续触发几次 Configure
+        if self.resize_after_id is not None:
+            self.root.after_cancel(self.resize_after_id)
+        self.resize_after_id = self.root.after(60, self._finish_resize)
+
+    def _finish_resize(self):
+        self.resize_after_id = None
+        self.is_resizing = False
+        self.render_current_frame()
+
+    def render_current_frame(self, fast=None):
+        """
+        始终完整显示视频（min 缩放），四周用模糊背景铺满，
+        保证 video_container 的任何区域都不会留白。
+
+        【P0 修复】这里原来有一句 `self.resize_after_id = None`：
+        它只丢掉定时器 ID、并不取消那个还活着的 after 回调，属于
+        渲染函数越权修改防抖状态。后果是 on_window_resize 之后再也
+        取消不掉它，防抖回调会重复排队、多渲染若干次。渲染函数
+        只负责画，不再碰任何定时器状态。
+        """
+        if fast is None:
+            fast = self.is_resizing
+
+        frame = self.current_frame_image
+        if frame is None:
+            return
+
+        # 读取 video_container 的实际尺寸（它由 grid 第 0 行决定）
+        win_w = self.video_container.winfo_width()
+        win_h = self.video_container.winfo_height()
+        if win_w <= 1 or win_h <= 1:
+            win_w = self.video_label.winfo_width()
+            win_h = self.video_label.winfo_height()
+        if win_w <= 1 or win_h <= 1:
+            win_w = self.root.winfo_width()
+            win_h = self.root.winfo_height() - 100
+        if win_w <= 1 or win_h <= 1:
+            win_w, win_h = 850, 520
+
+        h, w = frame.shape[:2]
+
+        # 前景：min 缩放，完整显示
+        fg_scale = min(win_w / w, win_h / h)
+        fg_w = max(1, int(w * fg_scale))
+        fg_h = max(1, int(h * fg_scale))
+        interp = cv2.INTER_AREA if fg_scale < 1.0 else cv2.INTER_LINEAR
+        fg = cv2.resize(frame, (fg_w, fg_h), interpolation=interp)
+
+        if fg_w == win_w and fg_h == win_h:
+            # 刚好铺满，直接用
+            canvas = fg
+        else:
+            # 需要填充背景
+            if fast:
+                # 拖动态：黑背景
+                canvas = np.zeros((win_h, win_w, 3), dtype=np.uint8)
+            else:
+                # 稳定态：模糊背景铺满整个窗口
+                bg_scale = max(win_w / w, win_h / h)
+                bg_w = max(1, int(w * bg_scale))
+                bg_h = max(1, int(h * bg_scale))
+                bg = cv2.resize(frame, (bg_w, bg_h), interpolation=cv2.INTER_LINEAR)
+
+                # 居中裁剪到窗口大小
+                bx = max(0, (bg_w - win_w) // 2)
+                by = max(0, (bg_h - win_h) // 2)
+                bg = bg[by:by + win_h, bx:bx + win_w]
+
+                # 降采样模糊，提高性能
+                small_w = max(1, win_w // 8)
+                small_h = max(1, win_h // 8)
+                bg_small = cv2.resize(bg, (small_w, small_h), interpolation=cv2.INTER_AREA)
+                bg_small = cv2.GaussianBlur(bg_small, (0, 0), sigmaX=3, sigmaY=3)
+                bg = cv2.resize(bg_small, (win_w, win_h), interpolation=cv2.INTER_LINEAR)
+                bg = cv2.convertScaleAbs(bg, alpha=0.45, beta=0)
+                canvas = bg
+
+            # 把前景居中贴上去
+            x0 = (win_w - fg_w) // 2
+            y0 = (win_h - fg_h) // 2
+            canvas[y0:y0 + fg_h, x0:x0 + fg_w] = fg
+
+        cv2image = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGBA)
+        imgtk = ImageTk.PhotoImage(image=Image.fromarray(cv2image))
+        self.video_label.imgtk = imgtk
+        self.video_label.config(image=imgtk)
+
+    def open_video(self, file_path=None):
+        if file_path is None:
+            file_path = filedialog.askopenfilename(filetypes=[("MP4 Video", "*.mp4"), ("All Files", "*.*")])
+            if not file_path: return
+
+        # 停止旧视频的播放循环，防止定时器叠加导致加速
+        self.is_playing = False
+        self._cancel_pending_frame()
+
+        self.current_video_path = file_path
+        if self.cap is not None: self.cap.release()
+
+        self.cap = cv2.VideoCapture(file_path)
+        if not self.cap.isOpened():
+            messagebox.showerror("错误", "无法打开视频文件")
+            return
+
+        # 释放旧的音频播放器
+        if self.audio_player is not None:
+            try:
+                self.audio_player.close_player()
+            except Exception:
+                pass
+            self.audio_player = None
+
+        # 创建新的音频播放器（与视频同一文件）
+        try:
+            self.audio_player = MediaPlayer(
+                file_path,
+                ff_opts={'paused': False, 'volume': self.audio_volume}
+            )
+        except Exception as e:
+            print(f"音频初始化失败（将静音播放）: {e}")
+            self.audio_player = None
+
+        fps = self.cap.get(cv2.CAP_PROP_FPS)
+        self.video_fps = fps if fps > 0 else 30.0
+
+        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.scale.config(to=self.total_frames)
+        self.seek_var.set(0)
+
+        self.is_playing = True
+        self.is_paused = False
+        self.btn_play.config(text="暂停")
+        self.update_frame()
+
+    def start_conversion(self):
+        if self.is_converting:
+            messagebox.showwarning("提示", "正在转换中，请稍候...")
+            return
+
+        file_path = filedialog.askopenfilename(
+            filetypes=[("MP4 Video", "*.mp4"), ("All Files", "*.*")]
+        )
+        if not file_path:
+            return
+
+        self.is_converting = True
+        self.conversion_cancel_event.clear()
+
+        # 显示转换进度面板
+        self.conversion_frame.grid()
+        self.conv_label.config(text="正在加载模型，请稍候...")
+        self.conv_progress_var.set(0)
+        self.btn_cancel_convert.config(text="取消转换", state=tk.NORMAL)
+
+        self.btn_convert.config(text="转换中...", state=tk.DISABLED)
+
+        thread = threading.Thread(target=self.process_video_to_3d, args=(file_path,))
+        thread.daemon = True
+        thread.start()
+
+    def process_video_to_3d(self, input_path):
+        output_path = "temp_3d_output.mp4"
+        cap = None
+        out = None
+        cancelled = False
+        try:
+            if self.model is None:
+                print("正在加载深度估计模型...")
+                model_id = "depth-anything/Depth-Anything-V2-Small-hf"
+                self.image_processor = AutoImageProcessor.from_pretrained(model_id)
+                self.model = AutoModelForDepthEstimation.from_pretrained(model_id).to(self.device)
+                print("模型加载完成！")
+
+            cap = cv2.VideoCapture(input_path)
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(output_path, fourcc, fps, (width * 2, height))
+
+            max_disparity = 20
+            x_base, y_base = np.meshgrid(np.arange(width), np.arange(height))
+            x_base, y_base = x_base.astype(np.float32), y_base.astype(np.float32)
+
+            frame_count = 0
+            start_time = time.time()
+
+            while cap.isOpened():
+                # 【取消检查】每帧都检查一次取消标志
+                if self.conversion_cancel_event.is_set():
+                    cancelled = True
+                    print("用户取消了转换")
+                    break
+
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frame_count += 1
+
+                # --- 深度估计 ---
+                image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                image_pil = Image.fromarray(image)
+                inputs = self.image_processor(images=image_pil, return_tensors="pt").to(self.device)
+                with torch.no_grad():
+                    outputs = self.model(**inputs)
+                    predicted_depth = outputs.predicted_depth
+
+                prediction = torch.nn.functional.interpolate(
+                    predicted_depth.unsqueeze(1), size=image_pil.size[::-1],
+                    mode="bicubic", align_corners=False
+                )
+                depth_output = prediction.squeeze().cpu().numpy()
+                # 【P0 修复】原来直接用 np.max(depth_output) 当除数：
+                # 纯色/全黑等"平坦帧"的最大深度为 0，除零得到 NaN，
+                # astype("uint8") 之后就是一张垃圾图，连镜像都会被污染。
+                depth_output = np.nan_to_num(depth_output, nan=0.0,
+                                             posinf=0.0, neginf=0.0)
+                d_max = float(np.max(depth_output)) if depth_output.size else 0.0
+                if d_max > 1e-6:
+                    depth_map = (depth_output * 255.0 / d_max).astype("uint8")
+                else:
+                    depth_map = np.zeros(depth_output.shape, dtype="uint8")
+
+                depth_normalized = depth_map.astype(np.float32) / 255.0
+                shift = depth_normalized * max_disparity
+                left_eye = cv2.remap(frame, x_base + shift, y_base,
+                                     cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+                right_eye = cv2.remap(frame, x_base - shift, y_base,
+                                      cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+                sbs_frame = np.hstack((left_eye, right_eye))
+                out.write(sbs_frame)
+
+                # 【进度更新】每 5 帧回传一次，避免频繁调用 root.after
+                if frame_count % 5 == 0 or frame_count == total_frames:
+                    self.root.after(
+                        0, self._update_conversion_progress,
+                        frame_count, total_frames, start_time
+                    )
+
+            cap.release()
+            cap = None
+            out.release()
+            out = None
+
+            if cancelled:
+                # 删除写到一半的临时文件
+                try:
+                    if os.path.exists(output_path):
+                        os.remove(output_path)
+                except Exception as e:
+                    print(f"删除临时文件失败: {e}")
+                self.root.after(0, self._on_conversion_cancelled)
+            else:
+                self.root.after(0, self.on_conversion_done, output_path)
+
+        except Exception as e:
+            print(f"转换出错: {e}")
+            if cap is not None:
+                cap.release()
+            if out is not None:
+                out.release()
+            if cancelled:
+                try:
+                    if os.path.exists(output_path):
+                        os.remove(output_path)
+                except Exception:
+                    pass
+                self.root.after(0, self._on_conversion_cancelled)
+            else:
+                self.root.after(0, lambda: messagebox.showerror("转换错误", str(e)))
+                self.root.after(0, self._reset_conversion_ui)
+
+    def _update_conversion_progress(self, current, total, start_time):
+        """在主线程更新进度条和文字"""
+        elapsed = time.time() - start_time
+
+        if total > 0:
+            percent = current / total * 100
+            self.conv_progress_var.set(percent)
+
+            if current > 0 and elapsed > 0:
+                eta = elapsed / current * (total - current)
+                eta_str = f"{int(eta // 60)}分{int(eta % 60)}秒"
+            else:
+                eta_str = "--"
+
+            self.conv_label.config(
+                text=f"转换中: {current}/{total} 帧 ({percent:.1f}%) - 预计剩余 {eta_str}"
+            )
+        else:
+            self.conv_label.config(text=f"转换中: 已处理 {current} 帧 - 预计剩余 --")
+
+    def cancel_conversion(self):
+        """用户点击取消按钮"""
+        if not self.is_converting:
+            return
+
+        if not messagebox.askyesno(
+                "确认取消",
+                "确定要取消当前转换吗？\n已处理的进度将被丢弃。"
+        ):
+            return
+
+        self.conversion_cancel_event.set()
+        self.btn_cancel_convert.config(text="正在取消...", state=tk.DISABLED)
+        self.conv_label.config(text="正在取消，请稍候...")
+
+    def _on_conversion_cancelled(self):
+        """转换线程已响应取消，恢复 UI"""
+        self.conversion_cancel_event.clear()
+        self._reset_conversion_ui()
+        messagebox.showinfo("已取消", "转换已取消，临时文件已清理。")
+
+    def _reset_conversion_ui(self):
+        """恢复转换按钮和进度面板到初始状态"""
+        self.is_converting = False
+        self.btn_convert.config(text="导入2D视频一键转3D", state=tk.NORMAL)
+        self.conversion_frame.grid_remove()
+        self.conv_progress_var.set(0)
+        self.conv_label.config(text="转换中: 0/0 (0%)")
+        self.btn_cancel_convert.config(text="取消转换", state=tk.NORMAL)
+
+    def on_conversion_done(self, output_path):
+        self._reset_conversion_ui()
+        self.open_video(output_path)
+
+        # 默认切为红蓝3D，方便师傅直接看
+        self.display_mode = "红蓝3D"
+        self.mode_var.set("红蓝3D")
+        messagebox.showinfo("完成", "转换完成！已自动开启红蓝3D模式，请戴上红蓝眼镜观看。")
+
+    # ============================================================
+    # 【关键修复】切换 3D 模式：不再重新 pack 底栏（那样会破坏打包顺序）
+    # grid 布局下底栏位置稳定，只需刷新画面即可
+    # ============================================================
+    def change_display_mode(self, event=None):
+        self.display_mode = self.mode_var.get()
+        self.root.update_idletasks()
+        if self.current_raw_frame is not None:
+            self.current_frame_image = self._process_3d(self.current_raw_frame)
+        self.render_current_frame()
+
+    def _on_space_key(self, event=None):
+        """全局空格键：播放 / 暂停。
+
+        【P0 修复】先看焦点在哪：焦点落在按钮、下拉框、输入框这类
+        "空格有原生含义"的控件上时直接放行，交给控件自己处理，
+        避免出现"按钮被激活 + 播放状态被切换"的双重动作。
+        """
+        focused = self.root.focus_get()
+        if isinstance(focused, SPACE_CONFLICT_WIDGETS):
+            return None
+        self.toggle_play()
+
+    def toggle_play(self):
+        if self.cap is None:
+            return
+        self.is_paused = not self.is_paused
+        self.btn_play.config(text="继续" if self.is_paused else "暂停")
+
+        # 同步音频
+        if self.audio_player is not None:
+            try:
+                if self.is_paused:
+                    self.audio_player.set_pause(True)
+                else:
+                    self.audio_player.set_pause(False)
+            except Exception:
+                pass
+
+        if not self.is_paused:
+            self.update_frame()
+
+    def change_speed(self, event):
+        self.playback_speed = float(self.speed_var.get().replace("x", ""))
+
+    # ============================================================
+    # 【关键修复】全屏切换改用 grid_remove / grid，避免混用 pack
+    # ============================================================
+    def toggle_fullscreen(self, event=None):
+        self.is_fullscreen = not self.is_fullscreen
+        self.root.attributes('-fullscreen', self.is_fullscreen)
+
+        if self.is_fullscreen:
+            # 进入全屏：绑定全局鼠标移动，启动自动隐藏
+            self.root.bind_all("<Motion>", self._on_mouse_move)
+            self._show_controls()
+            self._schedule_hide_controls()
+        else:
+            # 退出全屏：解绑，恢复常显
+            self.root.unbind_all("<Motion>")
+            if self._hide_controls_id is not None:
+                self.root.after_cancel(self._hide_controls_id)
+                self._hide_controls_id = None
+            self._show_controls()
+            self.root.config(cursor="")
+
+        self.root.update_idletasks()
+        self.render_current_frame()
+
+    def _schedule_hide_controls(self):
+        """重置隐藏计时器：鼠标停 2 秒后隐藏"""
+        if self._hide_controls_id is not None:
+            self.root.after_cancel(self._hide_controls_id)
+        self._hide_controls_id = self.root.after(2000, self._hide_controls)
+
+    def _hide_controls(self):
+        """隐藏底栏。video_container 会自动扩展，Configure 事件触发重绘。"""
+        self._hide_controls_id = None
+        if not self.is_fullscreen:
+            return
+        self.progress_frame.grid_remove()
+        self.btn_frame.grid_remove()
+        self.parallax_frame.grid_remove()
+        self.conversion_frame.grid_remove()
+        self.root.config(cursor="none")
+        self._controls_visible = False
+        # 不需要手动 render，video_container 尺寸变化会通过 Configure 事件自动触发
+
+    def _show_controls(self):
+        """显示底栏。video_container 会自动缩回，Configure 事件触发重绘。"""
+        if self.is_converting:
+            self.conversion_frame.grid()
+        self.progress_frame.grid()
+        self.btn_frame.grid()
+        self.parallax_frame.grid()
+        self.root.config(cursor="")
+        self._controls_visible = True
+        # 同样不需要手动 render
+
+    def _on_mouse_move(self, event=None):
+        if not self.is_fullscreen:
+            return
+        if not self._controls_visible:
+            self._show_controls()
+        self._schedule_hide_controls()
+
+    def save_screenshot(self):
+        if self.current_frame_image is None:
+            messagebox.showwarning("提示", "当前没有画面。")
+            return
+        cv2.imwrite("screenshot.jpg", self.current_frame_image)
+        messagebox.showinfo("截图成功", "已保存为 screenshot.jpg")
+
+    def export_3d_video(self):
+        """将转换好的3D视频导出为一个独立文件"""
+        temp_file = "temp_3d_output.mp4"
+        if not os.path.exists(temp_file):
+            messagebox.showwarning("提示", "没有找到3D视频文件。\n请先点击【导入2D视频一键转3D】生成3D视频，再点击导出。")
+            return
+
+        save_path = filedialog.asksaveasfilename(
+            defaultextension=".mp4",
+            filetypes=[("MP4 Video", "*.mp4")],
+            title="选择保存位置",
+            initialfile="我的3D视频.mp4"
+        )
+
+        if not save_path:
+            return
+
+        try:
+            shutil.copy(temp_file, save_path)
+            messagebox.showinfo("导出成功", f"3D视频已成功导出到：\n{save_path}\n\n可以直接发送给朋友，或使用支持3D的播放器观看。")
+        except Exception as e:
+            messagebox.showerror("导出错误", f"导出失败：\n{str(e)}")
+
+    def on_scale_move(self, value):
+        self.is_seeking = True
+        if self.cap is None: return
+        # 【P0 修复】改用 open_video 里已经做过兜底的 self.video_fps。
+        # 原来直接读 cap.get(CAP_PROP_FPS) 当除数，某些容器/流会返回 0，
+        # 一拖进度条就 ZeroDivisionError。
+        fps = self.video_fps if self.video_fps > 0 else 30.0
+        current_sec = int(float(value) / fps)
+        total_sec = int(self.total_frames / fps)
+        self.root.title(f"AI 3D 播放器 - {current_sec}秒 / {total_sec}秒")
+        if self.seek_timer is not None: self.root.after_cancel(self.seek_timer)
+        self.seek_timer = self.root.after(200, self.finish_seek)
+
+    def on_scale_click(self, event):
+        if self.cap is None: return
+        width = self.scale.winfo_width()
+        if width <= 1: return
+        ratio = max(0.0, min(1.0, event.x / width))
+        target_frame = int(ratio * self.total_frames)
+        self.seek_var.set(target_frame)
+        self.is_seeking = True
+        if self.seek_timer is not None: self.root.after_cancel(self.seek_timer)
+        self.seek_timer = self.root.after(200, self.finish_seek)
+        if self.is_paused:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+            self.update_frame(force=True)
+
+    def on_scale_release(self, event):
+        if self.cap is None: return
+        if self.seek_timer is not None: self.root.after_cancel(self.seek_timer)
+        self.finish_seek()
+
+    def finish_seek(self):
+        if self.cap is None: return
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, int(self.seek_var.get()))
+        self.is_seeking = False
+        if self.is_paused: self.update_frame(force=True)
+        self.seek_timer = None
+
+        # 同步音频位置
+        if self.audio_player is not None:
+            try:
+                self.audio_player.seek(
+                    int(self.seek_var.get()),
+                    relative=False,
+                    whence='frame'
+                )
+            except Exception:
+                pass
+
+    def _cancel_pending_frame(self):
+        """取消"下一帧"定时器，并把计时器引用清干净。
+
+        【P0 修复】播放循环有两个入口：定时器自身回调，以及
+        toggle_play / on_scale_click 里的直接调用。必须保证任何时刻
+        只有一个 after 挂起，否则会出现两条并行链、越播越快。
+        """
+        if self.after_id is not None:
+            try:
+                self.root.after_cancel(self.after_id)
+            except Exception:
+                pass
+            self.after_id = None
+
+    def _schedule_next_frame(self, delay_ms):
+        """统一下一帧的调度出口：先取消旧定时器，再挂新的。
+
+        调用它时既可能是"定时器正在回调"（取消自己是空操作），
+        也可能是"被直接调用"（此时取消掉了上一次遗留的挂起定时器），
+        两种情况都收敛成单链。
+        """
+        self._cancel_pending_frame()
+        self.after_id = self.root.after(max(1, int(delay_ms)), self.update_frame)
+
+    def update_frame(self, force=False):
+        if self.cap is None: return
+        if self.is_seeking and not force:
+            # 【P0 修复】这里原来直接 self.root.after(...) 而不登记 ID，
+            # 导致这条 is_seeking 轮询链在 on_close 里取消不掉，
+            # destroy 之后回调触发会抛 invalid command name。
+            self._schedule_next_frame(30)
+            return
+        if not self.is_playing or (self.is_paused and not force):
+            # 播放循环就此停止，清掉可能残留的定时器引用
+            self._cancel_pending_frame()
+            return
+
+        start_time = time.time()
+        ret, frame = self.cap.read()
+        if not ret:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, frame = self.cap.read()
+            if not ret: return
+
+        if not self.is_seeking:
+            self.current_frame = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
+            self.seek_var.set(self.current_frame)
+
+        # ================= 3D 核心处理区 =================
+        # 保存原始 SBS 帧（供暂停时调视差用）
+        self.current_raw_frame = frame.copy()
+
+        # 统一交给 _process_3d 处理，并渲染
+        self.current_frame_image = self._process_3d(frame)
+        self.render_current_frame()
+        # ==================================================
+
+        target_delay = int(1000 / self.video_fps)
+        process_time = (time.time() - start_time) * 1000
+        delay = max(1, int(target_delay / self.playback_speed) - int(process_time))
+
+        self._schedule_next_frame(delay)
+
+    def on_close(self):
+        """关闭窗口时彻底释放所有资源，确保进程真正退出"""
+        # 1. 通知转换线程退出（不等待，它是 daemon 线程）
+        if self.is_converting:
+            self.conversion_cancel_event.set()
+
+        # 2. 停止视频播放循环
+        self.is_playing = False
+        self.is_paused = True
+
+        # 3. 取消所有挂起的 after 定时器
+        for attr in ("after_id", "resize_after_id", "seek_timer", "_hide_controls_id"):
+            tid = getattr(self, attr, None)
+            if tid is not None:
+                try:
+                    self.root.after_cancel(tid)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+
+        # 4. 释放音频播放器（关键：不 close 会导致 SDL 线程不退出，进程卡住）
+        if self.audio_player is not None:
+            try:
+                self.audio_player.close_player()
+            except Exception:
+                pass
+            self.audio_player = None
+
+        # 5. 释放视频捕获
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+            self.cap = None
+
+        # 6. 销毁 Tk 窗口
+        try:
+            self.root.quit()
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+        # 7. 兜底：强制退出进程（应对 SDL / OpenCV 残留的非 daemon 线程）
+        os._exit(0)
+
+    def change_volume(self, value):
+        """音量滑块回调"""
+        self.audio_volume = float(value)
+        self.audio_muted = False
+        self.btn_mute.config(text="🔊")
+        if self.audio_player is not None:
+            try:
+                self.audio_player.set_volume(self.audio_volume)
+            except Exception:
+                pass
+
+    def toggle_mute(self):
+        """静音开关"""
+        self.audio_muted = not self.audio_muted
+        if self.audio_muted:
+            self.btn_mute.config(text="🔇")
+            if self.audio_player is not None:
+                try:
+                    self.audio_player.set_volume(0.0)
+                except Exception:
+                    pass
+        else:
+            self.btn_mute.config(text="🔊")
+            if self.audio_player is not None:
+                try:
+                    self.audio_player.set_volume(self.audio_volume)
+                except Exception:
+                    pass
+
+    def _get_mesh(self, h, w):
+        """缓存 remap 用的坐标网格，避免每帧重建"""
+        if self._mesh_hw != (h, w):
+            x = np.arange(w, dtype=np.float32)
+            y = np.arange(h, dtype=np.float32)
+            self._mesh_x, self._mesh_y = np.meshgrid(x, y)
+            self._mesh_hw = (h, w)
+        return self._mesh_x, self._mesh_y
+
+    def _process_3d(self, frame):
+        """把 SBS 原始帧处理成当前显示模式的帧"""
+        if self.display_mode == "2D":
+            return frame
+
+        h, w = frame.shape[:2]
+        w_half = w // 2
+        if w_half <= 0:
+            return frame
+
+        left_eye = frame[:, 0:w_half]
+        right_eye = frame[:, w_half:w]
+        left_eye = cv2.resize(left_eye, (w_half, h))
+        right_eye = cv2.resize(right_eye, (w_half, h))
+
+        # 【新增】交换左右眼
+        if self.swap_eyes:
+            left_eye, right_eye = right_eye, left_eye
+
+        # 【新增】实时视差调节
+        extra = self.parallax_value
+        if extra != 0:
+            x_base, y_base = self._get_mesh(h, w_half)
+            left_eye = cv2.remap(left_eye, x_base + extra, y_base,
+                                 cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+            right_eye = cv2.remap(right_eye, x_base - extra, y_base,
+                                  cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+        # 3D 合成（逻辑与原代码一致）
+        if self.display_mode == "红蓝3D":
+            b_l, g_l, r_l = cv2.split(left_eye)
+            b_r, g_r, r_r = cv2.split(right_eye)
+            return cv2.merge((b_l, g_l, r_r))
+
+        elif self.display_mode == "偏振-隔行":
+            combined = np.zeros_like(left_eye)
+            combined[0::2, :] = left_eye[0::2, :]
+            combined[1::2, :] = right_eye[1::2, :]
+            return combined
+
+        elif self.display_mode == "偏振-隔列":
+            combined = np.zeros_like(left_eye)
+            combined[:, 0::2] = left_eye[:, 0::2]
+            combined[:, 1::2] = right_eye[:, 1::2]
+            return combined
+
+        elif self.display_mode == "偏振-棋盘":
+            combined = np.zeros_like(left_eye)
+            combined[0::2, 0::2] = left_eye[0::2, 0::2]
+            combined[0::2, 1::2] = right_eye[0::2, 1::2]
+            combined[1::2, 0::2] = right_eye[1::2, 0::2]
+            combined[1::2, 1::2] = left_eye[1::2, 1::2]
+            return combined
+
+        return frame
+
+    def change_parallax(self, value):
+        """视差滑块回调"""
+        self.parallax_value = float(value)
+        self.parallax_label.config(text=f"视差: {int(self.parallax_value)}")
+
+        # 暂停状态下立即刷新当前帧，让用户看到实时效果
+        if self.is_paused and self.current_raw_frame is not None:
+            self.current_frame_image = self._process_3d(self.current_raw_frame)
+            self.render_current_frame()
+
+    def toggle_swap_eyes(self):
+        """交换左右眼"""
+        self.swap_eyes = not self.swap_eyes
+        self.btn_swap_eyes.config(
+            text="已交换左右眼" if self.swap_eyes else "交换左右眼"
+        )
+
+        if self.is_paused and self.current_raw_frame is not None:
+            self.current_frame_image = self._process_3d(self.current_raw_frame)
+            self.render_current_frame()
+
+    def setup_dark_theme(self):
+        """配置全局深色主题：clam 风格 + 深灰配色"""
+        self.root.configure(bg=DARK_BG)
+
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            style.theme_use("alt")
+
+        # 全局 ttk 默认样式
+        style.configure(".",
+                        background=DARK_BG,
+                        foreground=DARK_FG,
+                        fieldbackground=DARK_BG3,
+                        bordercolor=DARK_BG3,
+                        lightcolor=DARK_BG3,
+                        darkcolor=DARK_BG3,
+                        troughcolor=DARK_BG2,
+                        focuscolor=DARK_BG3,
+                        )
+
+        # Scale（播放进度、音量、视差）
+        style.configure("TScale",
+                        background=DARK_BG,
+                        troughcolor=DARK_BG2,
+                        bordercolor=DARK_BG2,
+                        lightcolor=DARK_HL,
+                        darkcolor=DARK_HL,
+                        )
+        style.map("TScale",
+                  background=[("active", DARK_HL)],
+                  )
+
+        # Progressbar（转换进度）
+        style.configure("TProgressbar",
+                        background=DARK_ACCENT,
+                        troughcolor=DARK_BG2,
+                        bordercolor=DARK_BG2,
+                        lightcolor=DARK_ACCENT,
+                        darkcolor=DARK_ACCENT,
+                        )
+
+        # Combobox（3D模式、倍速）
+        style.configure("TCombobox",
+                        fieldbackground=DARK_BG3,
+                        background=DARK_BG3,
+                        foreground=DARK_FG,
+                        arrowcolor=DARK_FG,
+                        bordercolor=DARK_BG3,
+                        )
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", DARK_BG3)],
+                  foreground=[("readonly", DARK_FG)],
+                  background=[("readonly", DARK_BG3)],
+                  )
+
+        # Combobox 下拉列表（这是 tk.Listbox，需要用 option_add 单独配）
+        self.root.option_add("*TCombobox*Listbox.background", DARK_BG3)
+        self.root.option_add("*TCombobox*Listbox.foreground", DARK_FG)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", DARK_ACCENT)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = VideoPlayerApp(root)
+    root.mainloop()
