@@ -637,6 +637,305 @@ class ResumeDialog:
         return self.choice
 
 
+class SubtitleSearchDialog:
+    """【第 21 轮·新】"自己挑一份字幕"的模态对话框。
+
+    ## 为什么非要有它
+
+    实测出来的硬伤：**文件名里没有年份时，自动匹配没法确定是哪一部片。**
+    搜 `The.Matrix.mkv` 返回的 50 条里**一条正主都没有**（32 条续集 + 14 条
+    续集 + 4 条纪录片）；搜 `阿凡达.mkv` 返回 32 条《阿凡达 2》(2020) 和
+    18 条《阿凡达》(2009)。这不是排序问题 —— 接口给回来的候选里就混着
+    好几年的片子，怎么排都定不下来。
+
+    这种情况与其硬下一份错的（白花一次当天配额，而且字幕画到屏幕上才
+    发现对不上），不如把候选摆出来让人一眼挑走。改片名/年份能重搜，
+    所以连"接口对中文剧名支持不好"这类问题（实测搜「权力的游戏」返回
+    0 条）也有了出路 —— 换个英文名再搜。
+
+    ## 跟 ResumeDialog 同一套范式
+
+    `__init__` 只建、`show()` 才 `grab_set` + `wait_window`：测试可以只建
+    不等（模态等待会把无人值守的回归整轮挂死）。
+
+    ## 搜索为什么在后台线程
+
+    搜索是网络请求，卡住就是整个窗口没响应。但 `after` **绝不能从后台
+    线程调用**（实测 `RuntimeError: main thread is not in main loop`，
+    而且后台线程自己抓不住这个异常）—— 所以跟主窗口那边一样，走
+    "队列 + 主线程自我续期的 after 轮询"。关窗口时**必须 `after_cancel`**：
+    窗口都销毁了还在排 after，只会换来一串 `invalid command name ...`。
+    """
+
+    def __init__(self, master, video_path, api_key, candidates=None,
+                 info=None, reason="", video_fps=0.0, session=None):
+        self.choice = None
+        self.candidates = []
+        self.session = session
+        self.api_key = api_key
+        self.video_path = video_path
+        self.video_fps = video_fps or 0.0
+        self.info = dict(info or {})
+        self._searching = False
+        self._after_id = None
+        self._queue = None
+
+        self.top = tk.Toplevel(master)
+        self.top.title("挑一份字幕")
+        self.top.configure(bg=DARK_BG)
+        self.top.resizable(False, False)
+        try:
+            self.top.transient(master)
+        except tk.TclError:
+            pass
+
+        wrap = tk.Frame(self.top, bg=DARK_BG, padx=18, pady=14)
+        wrap.pack(fill=tk.BOTH, expand=True)
+
+        if reason:
+            tk.Label(wrap, text=reason, bg=DARK_BG, fg=DARK_ACCENT,
+                     font=("Microsoft YaHei UI", 10, "bold"),
+                     wraplength=520, justify="left").pack(anchor="w", pady=(0, 8))
+
+        # ---- 搜什么 ----
+        row = tk.Frame(wrap, bg=DARK_BG)
+        row.pack(fill=tk.X)
+        tk.Label(row, text="片名:", bg=DARK_BG, fg=DARK_FG).pack(side=tk.LEFT)
+        self.entry_query = tk.Entry(row, bg=DARK_BG3, fg=DARK_FG,
+                                    insertbackground=DARK_FG, relief=tk.FLAT,
+                                    width=34)
+        self.entry_query.pack(side=tk.LEFT, padx=(5, 12), ipady=3)
+        tk.Label(row, text="年份:", bg=DARK_BG, fg=DARK_FG).pack(side=tk.LEFT)
+        self.entry_year = tk.Entry(row, bg=DARK_BG3, fg=DARK_FG,
+                                   insertbackground=DARK_FG, relief=tk.FLAT,
+                                   width=6)
+        self.entry_year.pack(side=tk.LEFT, padx=(5, 12), ipady=3)
+        self.btn_search = tk.Button(row, text="搜索", command=self._start_search,
+                                    **BTN_PRIMARY)
+        self.btn_search.pack(side=tk.LEFT)
+
+        # 年份是这一类问题的总开关（见类注释），所以要在界面上说一句 ——
+        # 不说的话没人会想到去填它。
+        tk.Label(wrap, text="填上年份能精确得多（同名/同系列片子靠它分开）",
+                 bg=DARK_BG, fg=DARK_FG2,
+                 font=("Microsoft YaHei UI", 9)).pack(anchor="w", pady=(4, 8))
+
+        # ---- 候选列表 ----
+        box = tk.Frame(wrap, bg=DARK_BG)
+        box.pack(fill=tk.BOTH, expand=True)
+        self.listbox = tk.Listbox(
+            box, height=12, width=70, bg=DARK_BG3, fg=DARK_FG,
+            selectbackground=DARK_ACCENT, selectforeground="white",
+            highlightthickness=0, bd=0, activestyle="none",
+            font=("Microsoft YaHei UI", 9))
+        self.listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll = ttk.Scrollbar(box, orient=tk.VERTICAL,
+                               command=self.listbox.yview)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.listbox.config(yscrollcommand=scroll.set)
+
+        self.status = tk.Label(wrap, text="", bg=DARK_BG, fg=DARK_FG2,
+                               font=("Microsoft YaHei UI", 9),
+                               wraplength=520, justify="left")
+        self.status.pack(anchor="w", pady=(8, 0))
+
+        # ---- 按钮 ----
+        buttons = tk.Frame(wrap, bg=DARK_BG)
+        buttons.pack(fill=tk.X, pady=(12, 0))
+        self.btn_ok = tk.Button(buttons, text="下载这份", command=self._pick_selected,
+                                state=tk.DISABLED, **BTN_PRIMARY)
+        self.btn_ok.pack(side=tk.LEFT)
+        self.btn_cancel = tk.Button(buttons, text="取消",
+                                    command=lambda: self._close(None),
+                                    **BTN_NORMAL)
+        self.btn_cancel.pack(side=tk.RIGHT)
+
+        self.entry_query.bind("<Return>", lambda _e: self._start_search())
+        self.entry_year.bind("<Return>", lambda _e: self._start_search())
+        self.listbox.bind("<Return>", lambda _e: self._pick_selected())
+        self.listbox.bind("<Double-Button-1>", lambda _e: self._pick_selected())
+        self.top.bind("<Escape>", lambda _e: self._close(None))
+        self.top.protocol("WM_DELETE_WINDOW", lambda: self._close(None))
+
+        if info:
+            self.entry_query.insert(0, str(info.get("query") or ""))
+            if info.get("year"):
+                self.entry_year.insert(0, str(info["year"]))
+
+        self.top.update_idletasks()
+        self._center_on(master)
+
+        # ⚠️ 判据必须是 `is not None` 而不是真值判断：`candidates=[]` 的意思是
+        # **"已经搜过了，一条都没有"**（该铺个空列表并说句"换个词再试"），
+        # 跟 `None`（"还没搜"）是两回事。用真值判断会把前者错当成后者、
+        # 白白再搜一次，而且搜完之前按钮状态是错的。
+        if candidates is not None:
+            # 已经有候选了（自动匹配"定不下来"时带过来的）—— 直接摆出来，
+            # 不再搜一次。搜索不花配额，但白等一个来回没有意义。
+            self._fill(candidates)
+        else:
+            self._start_search()
+
+    # ---------- 界面 ----------
+
+    def _center_on(self, master):
+        try:
+            w, h = self.top.winfo_reqwidth(), self.top.winfo_reqheight()
+            x = master.winfo_rootx() + max(0, (master.winfo_width() - w) // 2)
+            y = master.winfo_rooty() + max(0, (master.winfo_height() - h) // 3)
+            self.top.geometry("+%d+%d" % (x, y))
+        except Exception:
+            pass
+
+    def _set_status(self, text):
+        try:
+            self.status.config(text=text)
+        except Exception:
+            pass
+
+    def _fill(self, candidates):
+        """把候选铺进列表。**空列表也要处理** —— 那是"换个词再搜"的提示。"""
+        self._searching = False
+        try:
+            self.btn_search.config(text="搜索", state=tk.NORMAL)
+            self.listbox.delete(0, tk.END)
+        except Exception:
+            return
+
+        self.candidates = list(candidates or [])
+        for candidate in self.candidates:
+            self.listbox.insert(tk.END,
+                                subtitle_online.describe_candidate(candidate))
+
+        if not self.candidates:
+            self.btn_ok.config(state=tk.DISABLED)
+            self._set_status("一条都没搜到 —— 换个片名、或者把年份去掉再试")
+            return
+
+        self.listbox.selection_set(0)
+        self.listbox.see(0)
+        self.btn_ok.config(state=tk.NORMAL)
+        movies = len({c.get("feature_id") or c.get("imdb_id")
+                      for c in self.candidates})
+        self._set_status("找到 %d 条，分属 %d 部片子 —— 选一条后点【下载这份】"
+                         % (len(self.candidates), movies))
+
+    # ---------- 搜索（后台线程 + 主线程轮询）----------
+
+    def _start_search(self):
+        if self._searching:
+            return
+        query = self.entry_query.get().strip()
+        year_text = self.entry_year.get().strip()
+        year = subtitle_online._int_or_none(year_text) if year_text else None
+        if year_text and year is None:
+            self._set_status("年份要填数字，比如 1999")
+            return
+        if not query:
+            self._set_status("先填片名")
+            return
+
+        self._searching = True
+        self.btn_search.config(text="搜索中…", state=tk.DISABLED)
+        self.btn_ok.config(state=tk.DISABLED)
+        self.listbox.delete(0, tk.END)
+        self.candidates = []
+        self._set_status("正在搜…")
+
+        # 每次搜索都用一条全新的队列，不然上一次的结果会被这一次捡走
+        self._queue = queue.Queue()
+        thread = threading.Thread(
+            target=self._worker,
+            args=(query, year, self.info.get("season"),
+                  self.info.get("episode")),
+            name="subtitle-search", daemon=True)
+        thread.start()
+        self._poll()
+
+    def _worker(self, query, year, season, episode):
+        """后台线程：**只往队列里放一个元组，绝不碰任何 Tk 对象。**"""
+        try:
+            client = subtitle_online.OpenSubtitles(self.api_key,
+                                                   session=self.session)
+            found = subtitle_online.search_candidates(
+                client, query=query, year=year, season=season,
+                episode=episode, video_fps=self.video_fps)
+            payload = ("ok", found)
+        except Exception as exc:
+            payload = ("error", str(exc))
+        try:
+            self._queue.put(payload)
+        except Exception:
+            pass
+
+    def _poll(self):
+        """主线程：看后台线程有没有结果。**只允许主线程调用。**"""
+        if not self._searching:
+            return
+        try:
+            payload = self._queue.get_nowait()
+        except queue.Empty:
+            try:
+                self._after_id = self.top.after(ONLINE_POLL_INTERVAL_MS,
+                                                self._poll)
+            except Exception:
+                self._searching = False
+            return
+        except Exception:
+            self._searching = False
+            try:
+                self.btn_search.config(text="搜索", state=tk.NORMAL)
+            except Exception:
+                pass
+            self._set_status("搜索结果读不出来，请再试一次")
+            return
+
+        if payload[0] == "ok":
+            self._fill(payload[1])
+        else:
+            self._searching = False
+            try:
+                self.btn_search.config(text="搜索", state=tk.NORMAL)
+            except Exception:
+                pass
+            self._set_status("搜索失败：%s" % payload[1])
+
+    # ---------- 收尾 ----------
+
+    def _pick_selected(self):
+        selection = self.listbox.curselection()
+        if not selection or not self.candidates:
+            self._set_status("先在上面选一条")
+            return
+        index = selection[0]
+        if 0 <= index < len(self.candidates):
+            self._close(self.candidates[index])
+
+    def _close(self, choice):
+        """记下选择、**取消挂起的 after**、关窗口。"""
+        self.choice = choice
+        self._searching = False
+        if self._after_id is not None:
+            try:
+                self.top.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+        try:
+            self.top.destroy()
+        except Exception:
+            pass
+
+    def show(self):
+        """等用户挑完；返回选中的候选（字典），取消则 `None`。"""
+        try:
+            self.top.grab_set()
+            self.top.wait_window()
+        except Exception:
+            pass
+        return self.choice
+
+
 class VideoPlayerApp:
     def __init__(self, root, playlist_path=None, resume_path=None):
         """搭建整个应用。
@@ -1076,6 +1375,14 @@ class VideoPlayerApp:
             command=self.match_subtitles_online, **BTN_NORMAL)
         self.btn_online.pack(side=tk.LEFT, padx=(10, 0))
         self.btn_online.bind("<Button-3>", lambda _event: self.open_online_settings())
+
+        # 【第 21 轮·新】自己搜、自己挑。存在的理由见 SubtitleSearchDialog
+        # 的类注释：文件名里没有年份时自动匹配**定不下来是哪部片**
+        # （实测搜 "The Matrix" 一条正主都没有），这种情况得让人看一眼。
+        self.btn_online_search = tk.Button(
+            self.aux_frame, text="搜索…",
+            command=self.open_subtitle_search, **BTN_NORMAL)
+        self.btn_online_search.pack(side=tk.LEFT, padx=(4, 0))
 
         # --- 视差与左右眼控制栏（仅 3D 模式有意义，见 _sync_parallax_visibility）---
         self.parallax_frame = tk.Frame(self.root, bg=DARK_BG)
@@ -2026,6 +2333,21 @@ class VideoPlayerApp:
         self._online_busy = False
         self.btn_online.config(text="在线匹配", state=tk.NORMAL)
 
+        if result.get("ambiguous"):
+            # **定不下来是哪部片 → 一份都不下**，把候选摆出来让人自己挑。
+            # 为什么不下：下一份错的花的是当天 5 次配额里的一次（未登录只有
+            # 5 次），而且用户当场看不出来 —— 字幕画到屏幕上才发现对不上。
+            # 搜索不计配额，所以这一支是**免费**的，只是多问一句。
+            found = result.get("candidates") or []
+            movies = len({c.get("feature_id") or c.get("imdb_id")
+                          for c in found})
+            self._set_playlist_status("匹配到多部片子，需要你挑一个")
+            self.open_subtitle_search(
+                candidates=found, info=result.get("info"),
+                reason="文件名里没有年份，搜到的 %d 条分属 %d 部片子 —— 挑一个吧"
+                       % (len(found), movies))
+            return
+
         # 记下来，下次点同一部片子时跳过它（"再点一次 = 换一条"）
         self._online_tried.setdefault(video_path, set()).add(
             result["candidate"]["file_id"])
@@ -2082,8 +2404,101 @@ class VideoPlayerApp:
 
         messagebox.showinfo("没能匹配到字幕",
                             "%s\n\n可以：\n"
+                            "· 点【搜索…】自己搜、自己挑（最管用）\n"
                             "· 再点一次【在线匹配】（会换下一条候选）\n"
                             "· 点【载入字幕】手动指定一个文件" % message)
+
+    def open_subtitle_search(self, candidates=None, info=None, reason=""):
+        """底栏【搜索…】：打开"自己挑一份字幕"的窗口。
+
+        两条来路，用同一扇窗：
+
+        · 用户主动点【搜索…】→ 不带参数，窗口打开后用文件名解析出的片名
+          和年份先搜一次；
+        · 自动匹配**定不下来**时（见 `subtitle_online.looks_ambiguous`）
+          → 带着已经搜好的候选和一句说明进来，不再白搜一遍。
+
+        挑中就下载。**用户的选择优先于我们的打分** —— 打分再精细也只是猜，
+        用户看一眼片名和年份就知道对不对。
+        """
+        target = self.current_video_path
+        if not target or not os.path.exists(target):
+            messagebox.showinfo("先打开一个视频", "还没有正在播放的视频，没法搜字幕。")
+            return
+        if self._online_busy:
+            self._set_playlist_status("上一个匹配还在跑，稍等一下")
+            return
+
+        if not self._online_api_key() and not self.open_online_settings():
+            return
+        api_key = self._online_api_key()
+        if not api_key:
+            return
+
+        # 没有 info 时（用户主动点的）自己解析一遍文件名，把输入框预填上
+        if info is None:
+            info = subtitle_online.analyze_filename(target)
+
+        video_fps = self.video_fps if self.cap is not None else 0.0
+        dialog = SubtitleSearchDialog(
+            self.root, target, api_key, candidates=candidates, info=info,
+            reason=reason, video_fps=video_fps)
+        chosen = dialog.show()
+        if chosen:
+            self.download_online_candidate(chosen)
+
+    def download_online_candidate(self, candidate):
+        """下载用户在候选列表里挑中的那一条。
+
+        跟 `match_subtitles_online` 只有一处不同：不再搜索、也不再打分，
+        直接下他点的那条。其余（按钮忙碌态、后台线程、回程处理）完全一样，
+        所以回程照旧走 `_poll_online` → `_online_done`。
+        """
+        if self._online_busy:
+            self._set_playlist_status("上一个匹配还在跑，稍等一下")
+            return
+        target = self.current_video_path
+        if not target or not os.path.exists(target):
+            messagebox.showinfo("先打开一个视频", "还没有正在播放的视频。")
+            return
+        api_key = self._online_api_key()
+        if not api_key:
+            return
+
+        self._online_busy = True
+        # 文字用「下载中…」而不是「匹配中…」：这条路是用户点名要的那一条，
+        # 不会再换候选，说"匹配"会让人以为还在挑。
+        self.btn_online.config(text="下载中…", state=tk.DISABLED)
+        self._set_playlist_status(
+            "正在下载 %s…" % subtitle_online.describe_candidate(candidate))
+
+        self._online_queue = queue.Queue()
+        self._online_thread = threading.Thread(
+            target=self._download_candidate_worker,
+            args=(target, api_key, candidate),
+            name="subtitle-download", daemon=True)
+        self._online_thread.start()
+        self.root.after(ONLINE_POLL_INTERVAL_MS, self._poll_online)
+
+    def _download_candidate_worker(self, video_path, api_key, candidate):
+        """后台线程：下载**指定的**那条候选。
+
+        回程格式跟 `_online_worker` 一模一样（元组第一项区分成败），
+        所以主线程那边只有一个入口要看。
+        """
+        try:
+            client = subtitle_online.OpenSubtitles(api_key)
+            result = subtitle_online.download_candidate(
+                client, video_path, candidate)
+            payload = ("ok", video_path, result)
+        except Exception as exc:
+            payload = ("error", str(exc),
+                       isinstance(exc, subtitle_online.NoAPIKey),
+                       isinstance(exc, subtitle_online.QuotaExceeded))
+        try:
+            self._online_queue.put(payload)
+        except Exception:
+            pass
 
     def _load_subtitles(self, video_path, explicit_path=None):
         """给这个视频装配字幕（自动找同名 / 用指定文件）。
@@ -3227,9 +3642,14 @@ class VideoPlayerApp:
             "  是看 3D 的时候 —— 就按 B 或勾上【字幕栏】：窗口底部会切出一条\n"
             "  纯色横条专放字幕，字幕再也不压画面，代价是画面小一点\n\n"
             "没有字幕文件？【在线匹配】可以直接去 OpenSubtitles 下一份：\n"
-            "· 它按视频文件的指纹精确匹配（比按片名搜准得多），优先挑中英双语，\n"
-            "  其次简体。下好的字幕存到视频旁边并自动加载\n"
+            "· 它先按视频文件的指纹精确匹配（比按片名搜准得多），再按片名+年份，\n"
+            "  优先挑中英双语，其次简体。下好的字幕存到视频旁边并自动加载\n"
             "· 对结果不满意就**再点一次**：会换下一条候选，不会重复下同一份\n"
+            "· **文件名里带上年份**（阿凡达.2009.mkv）能准得多 —— 同名片和同系列\n"
+            "  （《阿凡达》/《阿凡达2》）靠年份才分得开，没有年份它也认不出来\n"
+            "· 认不出是哪部片时它**不下错的那份**，直接打开列表让你挑（不花额度）\n"
+            "· 想自己搜自己挑：【搜索…】。填片名和年份，列表里每条都写清属于\n"
+            "  哪部片（原名+年份）、什么语种、多少帧、多少人下过\n"
             "· **绝不覆盖**你已有的字幕文件 —— 重名就退成 电影.zh.1.srt\n"
             "· 第一次用需要填一个免费的 API key（右键点【在线匹配】可以改）\n\n"
             "播放列表（右侧那一栏）：\n"

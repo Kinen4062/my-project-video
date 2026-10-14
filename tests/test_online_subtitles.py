@@ -125,18 +125,50 @@ class FakeSession:
         return [c for c in self.calls if c["url"].endswith(suffix)]
 
 
+def _movie(feature_id, title, year, imdb=None, kind="Movie",
+           season=None, episode=None, parent_imdb=None, parent_title=None):
+    """造一份 `attributes.feature_details`（"这条字幕属于哪部片"）。
+
+    ⚠️ `title` 永远传**英文原名** —— 这不是偷懒，是接口的真实行为：
+    实测搜《让子弹飞》返回的 `title` 是 `Let the Bullets Fly`，
+    搜《阿凡达》返回 `Avatar`。中文片名它压根不给。**整个"不能拿片名
+    比对"的结论就是从这条事实推出来的**，所以夹具也必须照着这个来，
+    否则测试会绿在一个真实世界里不成立的前提上。
+    """
+    details = {"feature_id": feature_id, "feature_type": kind,
+               "title": title, "year": year,
+               "imdb_id": imdb if imdb is not None else feature_id}
+    if season is not None:
+        details["season_number"] = season
+    if episode is not None:
+        details["episode_number"] = episode
+    if parent_imdb is not None:
+        details["parent_imdb_id"] = parent_imdb
+        details["parent_title"] = parent_title
+    return details
+
+
 def _candidate(file_id, language="zh-cn", downloads=5000, fps=23.976,
                hash_match=False, trusted=False, machine=False, ai=False,
-               hi=False, cds=1, release="", extra_files=0):
-    """造一条和 API 返回结构一致的搜索结果。"""
+               hi=False, cds=1, release="", extra_files=0, movie=None):
+    """造一条和 API 返回结构一致的搜索结果。
+
+    `movie` 是"这条属于哪部片"（`attributes.feature_details`），第 21 轮新增。
+    传 `None` 就是**老结构**（响应里没有这个键）—— 那种情况下新逻辑必须
+    完全不生效、行为跟改动前逐字节一样。老用例一条没改就全绿，靠的就是
+    这条"没有 feature_details 就退回老路"的保证。
+    """
     files = [{"file_id": file_id, "file_name": "x.srt"}]
     for i in range(extra_files):
         files.append({"file_id": file_id + 1000 + i, "file_name": "y.srt"})
-    return {"attributes": {
+    attributes = {
         "language": language, "download_count": downloads, "fps": fps,
         "from_trusted": trusted, "machine_translated": machine,
         "ai_translated": ai, "hearing_impaired": hi, "release": release,
-        "moviehash_match": hash_match, "files": files}}
+        "moviehash_match": hash_match, "files": files}
+    if movie is not None:
+        attributes["feature_details"] = movie
+    return {"attributes": attributes}
 
 
 def _payload(*candidates, total=None):
@@ -1028,6 +1060,487 @@ def section_quota_clock(s):
             "不带时区后缀的按 UTC 处理（跟显式 +00:00 同一结果）")
 
 
+# ============================================================
+# ⑫~⑰ 第 21 轮：把「配到别的片子」修掉
+#
+# 这一轮全部依据来自四轮真实接口测试（搜索不计配额，打得开）：
+#   · 搜 `The Matrix`，50 条里**一条正主都没有** —— 32 条《黑客帝国2》、
+#     14 条《黑客帝国3》、4 条纪录片；续集靠 28.8 万下载量排在最前。
+#   · 同一个查询加上 `year=1999`，50 条**全是 The Matrix(1999)**。
+#   · 搜 `阿凡达`，32 条是《阿凡达 2》(2020)、18 条才是《阿凡达》(2009)。
+#   · 接口返回的 `feature_details.title` **永远是英文原名**
+#     （《让子弹飞》→ `Let the Bullets Fly`），中文文件名根本没法比片名。
+# ============================================================
+
+def section_year_and_ids(s):
+    s.section("⑫ 年份读最后一个 + 编号规范化")
+
+    # 为什么必须读**最后**一个：片名里带数字的情况真实存在，而它排在前面。
+    # 《2012》是 2009 年的电影，文件名 `2012.2009.1080p.mkv` 取第一个会拿到
+    # 2012 —— 实测搜出来是 Coldplay 演唱会那一类 2012 年的东西；取最后一个
+    # （2009）才命中正主（imdb=1190080）。
+    cases = [
+        ("2012.2009.1080p.BluRay.mkv", 2009),
+        ("1917.2019.1080p.mkv", 2019),
+        ("The.Matrix.1999.1080p.BluRay.mkv", 1999),
+        ("Movie.2020.1080p.mkv", 2020),
+        ("Show.S02E05.720p.mkv", None),
+        ("阿凡达.mkv", None),
+    ]
+    for name, want in cases:
+        info = so.analyze_filename(name)
+        s.check(info["year"] == want,
+                "%-38s → 年份 %s" % (name[:36], info["year"]))
+
+    s.check(so.analyze_filename("2012.2009.mkv")["query"] == "2012 2009",
+            "年份仍然留在搜索词里（它是有效的搜索信息，不该丢）")
+
+    id_cases = [("tt0133093", 133093), (" 133093 ", 133093), (133093, 133093),
+                ("TT0133093", 133093), ("", None), (None, None),
+                ("abc", None), ("tt", None)]
+    for raw, want in id_cases:
+        got = so._normalize_imdb(raw)
+        s.check(got == want, "imdb 编号 %-12r → %s" % (raw, got))
+    s.check(so._normalize_imdb("tt0133093") == 133093,
+            "网页上抄下来的「tt0133093」也是同一个编号（接口只认纯数字）")
+
+    s.check(so._int_or_none(True) is None,
+            "bool 不算数字（它是 int 的子类，不挡住 True 会变成 1）")
+    s.check(so._int_or_none(0) == 0, "0 是合法数字（不能跟「没有」混为一谈）")
+    s.check(so._int_or_none("7") == 7, "字符串数字也认")
+    s.check(so._int_or_none("7.5") is None, "小数不算（年份不会是小数）")
+    s.check(so._int_or_none(float("inf")) is None,
+            "Infinity 不抛（json 模块默认认这个非标准值，int(inf) 抛 OverflowError）")
+    s.check(so._int_or_none(float("nan")) is None, "NaN 不抛")
+
+
+def section_feature_details(s):
+    s.section("⑬ 接口给的「这条属于哪部片」")
+
+    matrix = _movie(646193, "The Matrix", 1999, imdb=133093)
+    got = so.parse_results(_payload(_candidate(1, movie=matrix)))[0]
+    s.check(got["feature_id"] == 646193, "feature_id（%s）" % got["feature_id"])
+    s.check(got["feature_year"] == 1999, "feature_year（%s）" % got["feature_year"])
+    s.check(got["feature_title"] == "The Matrix",
+            "feature_title（%r）" % got["feature_title"])
+    s.check(got["imdb_id"] == 133093, "imdb_id（%s）" % got["imdb_id"])
+
+    old = so.parse_results(_payload(_candidate(2)))[0]
+    s.check(old["feature_id"] is None and old["imdb_id"] is None,
+            "没有 feature_details 时字段是 None，不是 KeyError")
+    s.check(old["feature_title"] == "", "标题缺省是空串")
+
+    for bad in (None, [], "文字", 42):
+        malformed = {"attributes": {"language": "en", "feature_details": bad,
+                                    "files": [{"file_id": 9}]}}
+        parsed = so.parse_results({"data": [malformed]})
+        s.check(len(parsed) == 1 and parsed[0]["feature_id"] is None,
+                "feature_details 是 %r 也不抛" % (bad,))
+
+    episode = _movie(178961, "Pilot", 2008, imdb=959621, kind="Episode",
+                     season=1, episode=1, parent_imdb=903747,
+                     parent_title="Breaking Bad")
+    got = so.parse_results(_payload(_candidate(3, movie=episode)))[0]
+    s.check(got["season"] == 1 and got["episode"] == 1,
+            "剧集季集号（S%sE%s）" % (got["season"], got["episode"]))
+    s.check(got["parent_imdb_id"] == 903747
+            and got["parent_title"] == "Breaking Bad",
+            "剧集所属剧（%s / %s）" % (got["parent_imdb_id"], got["parent_title"]))
+
+    weird = {"attributes": {"language": "en", "votes": 0.0, "ratings": 0.0,
+                            "files": [{"file_id": 11}]}}
+    s.check(len(so.parse_results({"data": [weird]})) == 1,
+            "votes/ratings 是浮点也不抛（实测返回的就是 0.0）")
+
+    inf_case = {"attributes": {"language": "en", "votes": float("inf"),
+                               "files": [{"file_id": 12}]}}
+    s.check(len(so.parse_results({"data": [inf_case]})) == 1, "Infinity 也不抛")
+
+
+def section_year_scoring(s):
+    s.section("⑭ 年份校验：同系列的续集靠它才分得开")
+
+    fps = 23.976
+    matrix = _movie(646193, "The Matrix", 1999, imdb=133093)
+    revolutions = _movie(646061, "The Matrix Revolutions", 2003, imdb=234215)
+
+    right = so.parse_results(_payload(
+        _candidate(1, "en", downloads=100, movie=matrix)))[0]
+    wrong = so.parse_results(_payload(
+        _candidate(2, "ze", downloads=90000, movie=revolutions)))[0]
+
+    s.check(so.score_candidate(right, fps, 1999)
+            > so.score_candidate(wrong, fps, 1999),
+            "年份相符的那条**压过**下载量高 900 倍的双语续集（%.0f vs %.0f）"
+            "—— 这正是「配到别的片子」那件事"
+            % (so.score_candidate(right, fps, 1999),
+               so.score_candidate(wrong, fps, 1999)))
+
+    s.check(so.score_candidate(wrong, fps) > so.score_candidate(right, fps),
+            "…而**不**做年份校验时，赢的恰恰是那条错的（%.0f vs %.0f）——"
+            "这就是改动前的行为，也是必须加这一项的理由"
+            % (so.score_candidate(wrong, fps), so.score_candidate(right, fps)))
+
+    near = so.parse_results(_payload(
+        _candidate(3, "en", movie=_movie(3, "A", 2000))))[0]
+    far = so.parse_results(_payload(
+        _candidate(4, "en", movie=_movie(4, "A", 2003))))[0]
+    s.check(so.score_candidate(near, fps, 1999)
+            > so.score_candidate(far, fps, 1999),
+            "差 1 年跟差 2 年以上要区别对待 —— 发行年 ≠ 制作年是真实存在的"
+            "（实测 The Matrix Revisited：release 写 2002、年份字段 2001）")
+    s.check(so.score_candidate(far, fps, 1999)
+            < so.score_candidate(far, fps) - 400,
+            "年份明显不符要重罚（%.0f → %.0f）"
+            % (so.score_candidate(far, fps), so.score_candidate(far, fps, 1999)))
+
+    no_year = so.parse_results(_payload(
+        _candidate(5, "en", movie=_movie(5, "A", None))))[0]
+    s.check(so.score_candidate(no_year, fps, 1999)
+            == so.score_candidate(no_year, fps),
+            "候选没给年份 → 不奖不罚（「不知道」不等于「不符」）")
+
+    unknown = so.parse_results(_payload(_candidate(6, "en")))[0]
+    s.check(so.score_candidate(unknown, fps, 1999)
+            == so.score_candidate(unknown, fps),
+            "我们不知道年份时也不评这一项（不能拿一个猜的年份去罚别人）")
+
+    hash_wrong = so.parse_results(_payload(
+        _candidate(7, "en", hash_match=True, movie=_movie(7, "A", 2003))))[0]
+    s.check(so.score_candidate(hash_wrong, fps, 1999) > 0,
+            "但指纹精确匹配必须还能压过年份不符（%.0f > 0）——"
+            "「有人拿一模一样这个文件配过字幕」比库里的年份元数据更硬"
+            % so.score_candidate(hash_wrong, fps, 1999))
+
+
+def section_anchor(s):
+    s.section("⑮ 认出是哪部片：pick_anchor / looks_ambiguous")
+
+    matrix = _movie(646193, "The Matrix", 1999, imdb=133093)
+    revolutions = _movie(646061, "The Matrix Revolutions", 2003, imdb=234215)
+    same_year_other = _movie(700001, "The Matrix Revisited", 1999)
+
+    def listing(*cands):
+        return so.parse_results(_payload(*cands))
+
+    no_year_info = {"year": None, "season": None, "episode": None}
+    year_info = {"year": 1999, "season": None, "episode": None}
+
+    s.check(so.pick_anchor(listing(_candidate(1, movie=matrix)), no_year_info) is None,
+            "没有年份 → **绝不锚定**（实测无年份时按条数挑会挑成《阿凡达 2》）")
+    s.check(so.pick_anchor([], year_info) is None, "空候选不锚")
+
+    big = listing(*[_candidate(100 + i, movie=matrix) for i in range(8)],
+                  _candidate(200, movie=revolutions))
+    anchor = so.pick_anchor(big, year_info)
+    s.check(anchor is not None and anchor["feature_id"] == 646193,
+            "年份相符、条数又突出 → 锚定到 The Matrix(1999)（%s）"
+            % (anchor or {}).get("feature_id"))
+
+    only_sequels = listing(*[_candidate(100 + i, movie=revolutions)
+                             for i in range(5)])
+    s.check(so.pick_anchor(only_sequels, year_info) is None,
+            "候选里全是续集（年份都不符）→ 池子是空的，不锚 ——"
+            "这正是「搜 The Matrix 一条正主都没有」那种情况")
+
+    even = listing(*[_candidate(100 + i, movie=matrix) for i in range(3)],
+                   *[_candidate(200 + i, movie=same_year_other) for i in range(2)])
+    s.check(so.pick_anchor(even, year_info) is None,
+            "同年份、不同片、条数势均力敌（3 vs 2）→ 不锚"
+            "（分不清就别乱锁，锁错了是把另一部片的字幕硬塞给用户）")
+
+    ep = _movie(178961, "Pilot", 2008, imdb=959621, kind="Episode",
+                season=1, episode=1, parent_imdb=903747,
+                parent_title="Breaking Bad")
+    other_ep = _movie(555001, "Pilot", 2011, imdb=555001, kind="Episode",
+                      season=1, episode=1, parent_imdb=666001,
+                      parent_title="Other Show")
+    episodes = listing(*[_candidate(300 + i, movie=ep) for i in range(5)],
+                       _candidate(400, movie=other_ep))
+    anchor = so.pick_anchor(episodes, {"year": None, "season": 1, "episode": 1})
+    s.check(anchor is not None and anchor["feature_id"] == 178961,
+            "剧集**不需要年份**：按季集号就能认出来（实测按片名搜出来 24 条"
+            "是 4 集不同的剧）")
+
+    s.check(so.looks_ambiguous([], no_year_info) is False,
+            "空候选不算「定不下来」—— 那是「压根没搜到」，由 fetch 报错")
+
+    one_movie = listing(*[_candidate(100 + i, movie=matrix) for i in range(5)])
+    s.check(so.looks_ambiguous(one_movie, no_year_info) is False,
+            "所有候选都是同一部片 → 定得下来（实测「盗梦空间.mkv」50 条全是 Inception）")
+
+    mostly = listing(*[_candidate(100 + i, movie=matrix) for i in range(49)],
+                     _candidate(200, movie=revolutions))
+    s.check(so.looks_ambiguous(mostly, no_year_info) is False,
+            "一部片占 49/50 → 定得下来（实测「黑客帝国.mkv」就是这个比例）")
+
+    mixed = listing(*[_candidate(100 + i, movie=_movie(1, "Avatar 2", 2020))
+                      for i in range(32)],
+                    *[_candidate(200 + i, movie=_movie(2, "Avatar", 2009))
+                      for i in range(18)])
+    s.check(so.looks_ambiguous(mixed, no_year_info) is True,
+            "32 条《阿凡达2》+ 18 条《阿凡达》→ **定不下来**，必须让人挑"
+            "（那 64% 是第二部，按条数挑就会挑错）")
+
+    s.check(so.looks_ambiguous(big, year_info) is False,
+            "年份对得上、锚得出来 → 定得下来")
+
+
+def section_anchor_flow(s):
+    s.section("⑯ 锚定重搜 / 手动搜索 / 指定下载（全链路）")
+
+    folder = _fresh("anchor_flow")
+    video = os.path.join(folder, "The.Matrix.1999.1080p.BluRay.mkv")
+    with open(video, "wb") as fh:
+        fh.write(b"x" * 2000)
+
+    matrix = _movie(646193, "The Matrix", 1999, imdb=133093)
+    revolutions = _movie(646061, "The Matrix Revolutions", 2003, imdb=234215)
+
+    session = FakeSession(search_queue=[
+        _payload(),                                             # 指纹轮：没命中
+        _payload(*[_candidate(100 + i, "en", movie=matrix) for i in range(4)],
+                 _candidate(200, "ze", movie=revolutions)),     # 片名轮：混着续集
+        _payload(*[_candidate(100 + i, "ze", movie=matrix) for i in range(3)]),
+    ])
+    client = so.OpenSubtitles("key", session=session)
+    ranked, info = so.find_candidates(client, video, 23.976)
+    params = [c["kwargs"]["params"] for c in session.find("/subtitles")]
+
+    s.check(params[1].get("year") == 1999,
+            "第二轮**带上了年份**（改动前漏传了，而就这一个参数决定成败）")
+    s.check(len(params) == 3 and params[2].get("imdb_id") == 133093,
+            "第四轮用 imdb_id 锚定重搜（%s）" % params[2].get("imdb_id"))
+    s.check(info["anchor"] is not None and info["anchor"]["feature_id"] == 646193,
+            "info 里记下了锚定到哪部片（状态行要说给用户听）")
+    s.check(all(c["feature_id"] == 646193 for c in ranked),
+            "锚定之后候选**全部**是 The Matrix(1999)，续集被清干净了（%d 条）"
+            % len(ranked))
+
+    session_fp = FakeSession(search=_payload(
+        _candidate(500, "en", hash_match=True, movie=matrix)))
+    client_fp = so.OpenSubtitles("key", session=session_fp)
+    _, info_fp = so.find_candidates(client_fp, video, 23.976)
+    s.check(info_fp["anchor"] is None and len(session_fp.find("/subtitles")) == 1,
+            "指纹精确命中时不再多搜 —— 「一模一样这个文件配过」比什么都硬")
+
+    avatar2 = [_candidate(100 + i, movie=_movie(1, "Avatar 2", 2020))
+               for i in range(4)]
+    avatar = [_candidate(200 + i, movie=_movie(2, "Avatar", 2009))
+              for i in range(3)]
+    session2 = FakeSession(search_queue=[_payload(), _payload(*(avatar2 + avatar))])
+    client2 = so.OpenSubtitles("key", session=session2)
+    result = so.fetch(client2, video, 23.976)
+    s.check(result.get("ambiguous") is True, "定不下来时不下载，把候选交回去让人挑")
+    s.check(result["path"] is None, "**一份都没下**")
+    s.check(not session2.find("/download"),
+            "确实没发出下载请求（搜索不计次、只有下载计次 → 这一支是免费的）")
+    s.check(len(result["candidates"]) == 7,
+            "候选都带回来了（%d 条）" % len(result["candidates"]))
+
+    session3 = FakeSession(search=_payload(
+        *[_candidate(100 + i, movie=matrix) for i in range(3)],
+        *[_candidate(200 + i, movie=revolutions) for i in range(3)]))
+    client3 = so.OpenSubtitles("key", session=session3)
+    manual = so.search_candidates(client3, query="The Matrix", year=1999)
+    s.check(len(manual) == 6,
+            "手动搜索**不锚定** —— 用户就是要看见所有可能（%d 条）" % len(manual))
+    s.check(len(session3.find("/subtitles")) == 1, "只搜一次，不做锚定重搜")
+    s.check({c["feature_id"] for c in manual} == {646193, 646061},
+            "两部片都留在结果里（%s）" % sorted({c["feature_id"] for c in manual}))
+
+    try:
+        so.search_candidates(client3, query="")
+        s.check(False, "不给片名应该报错")
+    except so.OnlineError as exc:
+        s.check("片名" in str(exc), "空搜索词 → 明说原因：%s" % exc)
+
+    shuffled = so.parse_results(_payload(
+        _candidate(1, movie=matrix), _candidate(2, movie=revolutions),
+        _candidate(3, movie=matrix), _candidate(4, movie=revolutions),
+        _candidate(5, movie=matrix)))
+    order = [c["feature_id"] for c in so.group_by_feature(shuffled)]
+    s.check(order == [646193, 646193, 646193, 646061, 646061],
+            "同一部片的条目**连着排**（%s）—— 混着排用户看不出这里有两部片"
+            % order)
+    s.check(len(so.group_by_feature([])) == 0, "空列表分组不抛")
+
+    picked = so.parse_results(_payload(_candidate(222, "ze", movie=matrix)))[0]
+    session4 = FakeSession(blob=SRT_BODY.encode("utf-8"))
+    client4 = so.OpenSubtitles("key", session=session4)
+    got = so.download_candidate(client4, video, picked)
+    s.check(os.path.basename(got["path"]).endswith(".双语.srt"),
+            "用户挑的双语候选落成 .双语.srt（%s）" % os.path.basename(got["path"]))
+    s.check("The Matrix" in got["description"],
+            "描述里写出了属于哪部片：%s" % got["description"])
+    s.check(got["ambiguous"] is False, "指定下载永远不是 ambiguous")
+    s.check(session4.find("/subtitles") == [],
+            "指定下载**一次搜索都不做**（用户已经挑好了）")
+
+    # 年份缺失时的那句提示必须不一样 —— 否则用户会一直点【在线匹配】
+    hint_missing = so._no_result_hint({"query": "阿凡达", "year": None}, video)
+    hint_known = so._no_result_hint({"query": "阿凡达", "year": 2009}, video)
+    s.check("年份" in hint_missing and "搜索…" in hint_missing,
+            "文件名没年份而搜不到 → 指向【搜索…】：%s" % hint_missing)
+    s.check("年份" not in hint_known,
+            "有年份而搜不到 → 就是真的没有（别说些用不上的建议）：%s" % hint_known)
+
+
+def section_dialog(s):
+    s.section("⑰ 候选列表对话框（真实窗口）")
+
+    import time as _time
+    import tkinter as tk
+
+    from _harness import load_app, teardown
+
+    root, app, fp = load_app(subtitles=True)
+    try:
+        s.check(hasattr(app, "btn_online_search"), "底栏上真的有【搜索…】按钮")
+        s.check(app.btn_online_search.cget("text") == "搜索…",
+                "按钮文字是「搜索…」（%s）" % app.btn_online_search.cget("text"))
+        s.check(hasattr(app, "open_subtitle_search")
+                and hasattr(app, "download_online_candidate"),
+                "两个入口方法都在")
+
+        matrix = _movie(646193, "The Matrix", 1999, imdb=133093)
+        revolutions = _movie(646061, "The Matrix Revolutions", 2003, imdb=234215)
+        given = so.parse_results(_payload(
+            _candidate(1, "en", movie=matrix),
+            _candidate(2, "ze", movie=revolutions)))
+
+        # ---- 只建不等（模态等待会把无人值守的回归整轮挂死）----
+        dialog = fp.SubtitleSearchDialog(
+            root, os.path.join("D:/影片", "The.Matrix.mkv"), "fake-key",
+            candidates=given, info={"query": "The Matrix", "year": None},
+            reason="测试用")
+        try:
+            s.check(dialog.listbox.size() == 2,
+                    "给了候选就直接铺出来（%d 行）" % dialog.listbox.size())
+            s.check(dialog.listbox.curselection() == (0,), "默认选中的是第一条")
+            s.check("The Matrix (1999)" in dialog.listbox.get(0),
+                    "每行都写清属于哪部片：%s" % dialog.listbox.get(0))
+            s.check("Revolutions" in dialog.listbox.get(1),
+                    "第二条写的是另一部片：%s" % dialog.listbox.get(1))
+            s.check(dialog.entry_query.get() == "The Matrix",
+                    "片名预填了（%r）" % dialog.entry_query.get())
+            s.check(dialog.entry_year.get() == "",
+                    "没年份时年份框是空的（不是硬编一个 0）")
+
+            dialog.listbox.selection_clear(0, tk.END)
+            dialog.listbox.selection_set(1)
+            dialog._pick_selected()
+            s.check(dialog.choice is not None
+                    and dialog.choice["feature_id"] == 646061,
+                    "选中第二条点下载 → 返回的是**用户点的那条**（%s）"
+                    % (dialog.choice or {}).get("feature_id"))
+        finally:
+            dialog._close(None)
+
+        empty = fp.SubtitleSearchDialog(root, "D:/x/a.mkv", "key",
+                                        candidates=[], info={}, reason="")
+        try:
+            s.check(empty.listbox.size() == 0, "空候选时列表是空的")
+            s.check(str(empty.btn_ok.cget("state")) == "disabled",
+                    "空候选时下载按钮禁用")
+            empty._pick_selected()
+            s.check(empty.choice is None, "没得选就不返回东西")
+        finally:
+            empty._close(None)
+
+        typed = fp.SubtitleSearchDialog(root, "D:/x/a.mkv", "key",
+                                        candidates=given, info={}, reason="")
+        try:
+            typed.entry_query.delete(0, tk.END)
+            typed.entry_query.insert(0, "Avatar")
+            typed.entry_year.delete(0, tk.END)
+            typed.entry_year.insert(0, "去年")
+            typed._start_search()
+            s.check("数字" in typed.status.cget("text"),
+                    "年份填了非数字 → 提示要填数字，而不是拿它去搜：%s"
+                    % typed.status.cget("text"))
+            s.check(typed._searching is False, "没起搜索线程")
+        finally:
+            typed._close(None)
+
+        # ---- 自动匹配「定不下来」→ 打开列表 ----
+        folder = _fresh("dialog")
+        video = os.path.join(folder, "Movie.2020.1080p.mkv")
+        with open(video, "wb") as fh:
+            fh.write(b"x" * 100)
+        app.current_video_path = video
+
+        opened = {}
+        original_open = app.open_subtitle_search
+        app.open_subtitle_search = lambda **kw: opened.update(kw)
+        try:
+            app._online_done(video, {
+                "ambiguous": True, "candidates": given,
+                "info": {"query": "The Matrix", "year": None},
+                "path": None, "candidate": None, "description": "",
+                "meta": {}, "total_found": 2})
+            s.check(opened.get("candidates") is given,
+                    "定不下来 → 打开候选列表，并把候选交过去")
+            s.check("2" in (opened.get("reason") or ""),
+                    "说明里带上条数，让用户知道为什么弹这个窗：%s"
+                    % opened.get("reason"))
+            s.check(app._online_busy is False,
+                    "按钮状态必须复位（不然永远卡在「匹配中…」）")
+            s.check(app.btn_online.cget("text") == "在线匹配", "按钮文字复位")
+            s.check(video not in app._online_tried,
+                    "没下载 → 不往「已试过」里记（否则下次点会白白跳过一条）")
+        finally:
+            app.open_subtitle_search = original_open
+
+        # ---- 用户挑一条 → 走真实后台线程下载 ----
+        picked_file = os.path.join(folder, "picked.srt")
+        with open(picked_file, "wb") as fh:
+            fh.write(SRT_BODY.encode("utf-8"))
+
+        original_download = so.download_candidate
+        so.download_candidate = lambda *a, **k: {
+            "path": picked_file, "candidate": given[0],
+            "description": "The Matrix (1999) · 英文",
+            "meta": {}, "ambiguous": False, "total_found": 0, "info": None}
+        try:
+            app.online_api_key = "fake-key-for-test"
+            app.download_online_candidate(given[0])
+            s.check(app._online_busy is True, "挑一条下载会进入忙碌态")
+            s.check(app.btn_online.cget("text") == "下载中…",
+                    "文字是「下载中…」而不是「匹配中…」（%s）"
+                    % app.btn_online.cget("text"))
+
+            deadline = _time.time() + 15
+            while app._online_busy and _time.time() < deadline:
+                root.update()
+                _time.sleep(0.02)
+
+            s.check(not app._online_busy, "下载完自动收尾")
+            s.check(app.subtitle_set.available,
+                    "挑的那条被装上了（%s）" % app.subtitle_set.describe())
+            s.check("The Matrix" in app.playlist_status.cget("text"),
+                    "状态行说明匹配到了哪部片：%s"
+                    % app.playlist_status.cget("text"))
+        finally:
+            so.download_candidate = original_download
+
+        # ---- 关窗口不能留下挂起的 after ----
+        stray = fp.SubtitleSearchDialog(root, "D:/x/a.mkv", "key",
+                                        candidates=given, info={}, reason="")
+        stray._close(None)
+        s.check(stray._after_id is None, "关窗口时把挂起的定时器取消掉")
+        try:
+            for _ in range(5):
+                root.update()
+            s.check(True, "销毁之后事件泵还能正常跑（没有 invalid command name）")
+        except tk.TclError as exc:
+            s.check(False, "销毁之后事件泵报错：%s" % exc)
+    finally:
+        teardown(root, app)
+
+
+# ============================================================
+
 def main():
     summary = Summary("在线字幕匹配（第 20 轮）")
     section_filenames(summary)
@@ -1042,6 +1555,13 @@ def main():
     section_offline(summary)
     section_ui(summary)
     section_quota_clock(summary)
+    # ---- 第 21 轮：把「配到别的片子」修掉 ----
+    section_year_and_ids(summary)
+    section_feature_details(summary)
+    section_year_scoring(summary)
+    section_anchor(summary)
+    section_anchor_flow(summary)
+    section_dialog(summary)
     return summary.finish()
 
 
