@@ -20,13 +20,14 @@
 import ctypes
 import json
 import os
+import shutil
 import sys
 import time
 from ctypes import wintypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _harness import (PROJ, city_fixture, make_noaudio_fixture,  # noqa: E402
-                      pump, run_suite, work_dir)
+from _harness import (PROJ, Mixer, city_fixture, make_noaudio_fixture,  # noqa: E402
+                      pump, run_suite, to_mixer_level, work_dir)
 
 sys.path.insert(0, PROJ)
 import filedrop        # noqa: E402
@@ -300,9 +301,9 @@ def body(root, app, fp, s):
             "K（播放/暂停）也归播放器")
 
     # ==========================================================
-    # ⑨ 列表栏显隐
+    # ⑨ 列表栏显隐（手动开关 + 全屏自动隐藏/唤出）
     # ==========================================================
-    s.section("⑨ 列表栏显隐")
+    s.section("⑨ 列表栏显隐：手动开关 + 全屏自动收/唤")
     app.toggle_playlist()
     root.update()
     s.check(not app._playlist_visible and not app.playlist_frame.winfo_ismapped(),
@@ -315,6 +316,44 @@ def body(root, app, fp, s):
             "再点一次恢复显示")
     s.check(int(app.root.grid_columnconfigure(1)["minsize"]) == fp.PLIST_MIN_WIDTH,
             "恢复后列宽也还原")
+
+    # --- 全屏：列表栏要跟底栏一起收起来，也能一起唤回（第 15 轮·新）---
+    app.toggle_fullscreen()
+    root.update()
+    s.check(app.is_fullscreen, "已进入全屏")
+    app._hide_controls()                     # 直接调，免得等那 2 秒
+    root.update()
+    s.check(not app.playlist_frame.winfo_ismapped(),
+            "全屏自动隐藏时，列表栏跟着底栏一起收起来（不挡住画面）")
+    s.check(int(app.root.grid_columnconfigure(1)["minsize"]) == 0,
+            "同时把第 1 列宽度归零，视频区才铺得满")
+    s.check(app._playlist_visible,
+            "这只是临时收起，没有动用户的意愿开关（_playlist_visible 仍为 True）")
+
+    app._show_controls()                     # 等同于全屏下鼠标一晃
+    root.update()
+    s.check(app.playlist_frame.winfo_ismapped(), "唤出控件时列表栏一起回来")
+    s.check(int(app.root.grid_columnconfigure(1)["minsize"]) == fp.PLIST_MIN_WIDTH,
+            "列宽也跟着还原")
+
+    # 用户自己关过列表 → 全屏唤出控件时不该把列表强行拉出来
+    app.toggle_playlist()
+    root.update()
+    app._hide_controls()
+    root.update()
+    app._show_controls()
+    root.update()
+    s.check(not app._playlist_visible and not app.playlist_frame.winfo_ismapped(),
+            "用户主动关过列表后，全屏唤出控件也不会把列表强行拉出来")
+
+    app.toggle_fullscreen()                  # 退出全屏
+    root.update()
+    s.check(not app.is_fullscreen, "退出全屏")
+    app.toggle_playlist()                    # 恢复正常（后面还要用列表）
+    root.update()
+    s.check(app.playlist_frame.winfo_ismapped(), "恢复显示，后续用例可以继续用列表")
+    root.geometry("1000x700")                # 全屏改过尺寸，还原干净的环境
+    root.update()
 
     # ==========================================================
     # ⑩ 边界：列表里的文件被删了
@@ -329,6 +368,70 @@ def body(root, app, fp, s):
             "下一个条目文件不存在 → 跳过它；没有别的可播就返回 None（不会卡死重试）")
     s.check(gone in app._playlist_failed,
             "不存在的条目被记进「播不动」名单，下次不再重试")
+
+    # ==========================================================
+    # ⑪ 切换视频不阻塞主线程（第 15 轮·修复）
+    # ==========================================================
+    s.section("⑪ 切换视频不卡顿")
+    # 修复前：open_video 里**同步**调 close_player()，要等读线程退出 ——
+    # 实测 440~810ms（只有"上一个视频有音轨且真的在播"时才这么慢，中位数其实
+    # 只有 0.2ms），于是每点一次列表就卡一次；连续切换 8 次里它能占 83% 的耗时。
+    # 现在改成"先建后关"：摘下来止声（不阻塞）→ 建新播放器 → 旧的等新音频
+    # 确认在跑再由后台线程关。
+    #
+    # 本节的判据分三层，缺一不可：
+    #   ① 速度：每次切换的同步耗时必须在量级上降下来；
+    #   ② 安全："先建后关"不能把混音器拆掉（否则 set_volume 会踩 NULL），
+    #      所以拿两个**都有音轨**的文件互切，量真实混音通道值；
+    #   ③ 干净：每个被摘下的实例都要被交出去关掉，一个都不能漏、也不能堆积。
+    city2 = os.path.join(work_dir("plist_switch"), "city2.mp4")
+    os.makedirs(os.path.dirname(city2), exist_ok=True)
+    shutil.copyfile(city, city2)             # 内容相同但路径不同的第二个有音轨文件
+
+    app.playlist_clear(confirm=False)
+    app._playlist_add([city, city2])
+    app.audio_volume = 0.5
+    app._apply_volume_now()
+    level = to_mixer_level(0.5)
+
+    app.open_video(city)
+    pump(root, 1.5)
+    s.check(app._audio_calibrated,
+            "第一个有音轨文件已经出声（有\"要关的旧播放器\"才测得出这个卡顿）")
+
+    pair = [city, city2]
+    costs = []
+    for i in range(4):
+        t0 = time.perf_counter()
+        app._playlist_play(pair[(i + 1) % 2])
+        costs.append((time.perf_counter() - t0) * 1000.0)
+        pump(root, 0.6)
+    s.check(max(costs) < 150,
+            "每次切换的同步耗时都 < 150ms（修复前 440~810ms；本轮实测最大 %.0fms）"
+            % max(costs))
+    s.check(app._audio_calibrated, "来回切了几轮之后音频仍然活着（没有永久静音）")
+
+    mixer = Mixer()
+    if mixer.available:
+        s.check(mixer.channels_at(level),
+                "有音轨文件互切后音量仍然正确 —— 说明混音器全程没被拆掉"
+                "（这正是\"先建后关\"要保护的）")
+    else:
+        s.check(True, "跳过音量断言（%s）" % mixer.reason)
+
+    # 极快连点：速度远超"等新音频确认"所需时间。这时未确认的旧实例会被提前
+    # 交出去关，混音器可能被拆装一次 —— 判据不是"没被拆过"，而是"能恢复"。
+    for i in range(10):
+        app._playlist_play(pair[i % 2])
+        root.update()
+    pump(root, 2.0)
+    s.check(not [t for t in app._audio_retire_threads if t.is_alive()],
+            "极快连点后没有退场线程堆积")
+    s.check(app._audio_handoff_old is None, "极快连点后没有遗留的待关实例")
+    s.check(app.audio_player is not None, "极快连点后当前播放器还在")
+    app._playlist_play(city)
+    pump(root, 2.0)
+    s.check(app._audio_calibrated, "极快连点后切回有音轨文件仍能出声（混音器能重建）")
 
 
 if __name__ == "__main__":

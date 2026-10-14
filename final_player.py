@@ -178,6 +178,13 @@ SHORTCUT_SEEK_STEP_SEC = 10.0  # J/L 每按一次快退/快进的秒数
 #                                        先 set_pause/set_volume 都无效）
 # 所以卡顿的唯一有效对策就是"少重建" + "别在主线程重建"。
 #
+# 【第 15 轮·修复】"换文件"这条路径当初漏了：open_video 里是**同步**调
+#   close_player()，于是每点一次播放列表就卡一次（实测 440~810ms；连续切换
+#   8 次合计 1565ms，其中 83% 花在这一句上）—— 症状和当初"拖一下卡一下"
+#   一模一样，只是触发方式从"拖进度条"变成了"点列表"。
+#   现在换文件也走"先建后关"：_detach_audio_player()（摘下 + 止声，不阻塞）
+#   → 建新播放器 → _retire_audio_player()（旧的留到新音频确认在跑再后台关）。
+#
 # 【本次修复】"那 0.5 秒别占主线程"已经落地：见 _begin_audio_handoff()。
 #   做法是"后台音频交接"，三步走：
 #     ① 按住旧播放器（set_pause，静音）；② 主线程先建新播放器（≈1.6ms）；
@@ -947,21 +954,17 @@ class VideoPlayerApp:
         return None
 
     def toggle_playlist(self, event=None):
-        """显示 / 隐藏右侧列表栏。
+        """显示 / 隐藏右侧列表栏 —— 这是**用户的意愿开关**。
 
-        隐藏时必须把第 1 列的 minsize 也归零 —— `grid_remove` 只是"不管理这个
-        控件"，列宽约束还在，视频区右边会留下一条 236px 的空带。
+        【第 15 轮·改】只翻转 `_playlist_visible`，实际显隐交给
+        `_sync_playlist_visibility()`。因为"要不要显示"现在由两个条件共同决定
+        （用户意愿 + 全屏自动隐藏），这里只负责前者，别的地方（全屏隐藏/唤出）
+        负责后者。把 grid 操作留在两处各写一遍，迟早会漏掉 minsize 那一步。
         """
-        if self._playlist_visible:
-            self.playlist_frame.grid_remove()
-            self.root.grid_columnconfigure(1, minsize=0)
-            self._playlist_visible = False
-            self.btn_playlist.config(text="显示列表")
-        else:
-            self.playlist_frame.grid()
-            self.root.grid_columnconfigure(1, minsize=PLIST_MIN_WIDTH)
-            self._playlist_visible = True
-            self.btn_playlist.config(text="隐藏列表")
+        self._playlist_visible = not self._playlist_visible
+        self.btn_playlist.config(
+            text="隐藏列表" if self._playlist_visible else "显示列表")
+        self._sync_playlist_visibility()
         # 尺寸变了会触发 video_container 的 <Configure>，画面自动重绘，这里不用管
 
     def _on_files_dropped(self, paths):
@@ -1112,6 +1115,12 @@ class VideoPlayerApp:
         # 用它做 ss —— 交接要 0.5 秒，期间视频还在往前走，用请求时的旧位置
         # 会让新音频一开始就落后半秒（口型对不上）。
         self._last_media_sec = 0.0
+        # 【第 15 轮·修复】所有"正在后台关旧播放器"的线程。
+        # 换文件不再同步 close_player()（实测要等读线程退出 440~810ms，是
+        # "连点几下列表就一顿一顿"的唯一来源），改为交给后台线程关。
+        # 关窗时有界地 join 它们（见 _join_audio_retire），
+        # 免得进程退出时还有线程在拆 SDL 音频设备。
+        self._audio_retire_threads = []
 
     def _init_session_state(self):
         """本次会话的产物状态（导出按钮只认 session_output_path）"""
@@ -1306,15 +1315,21 @@ class VideoPlayerApp:
             messagebox.showerror("错误", "无法打开视频文件")
             return False
 
-        # 释放旧的音频播放器
-        # 【本次修复】换文件前必须先作废正在进行的后台交接：那次交接可能还有
-        # 一个旧实例等着被关（_audio_handoff_old）或正在工作线程里关，
-        # 不作废的话下面 _close_audio_player() 会把当前播放器也关掉，
-        # 而交接随后又会去关它自己那个 —— 两个 SDL 音频设备拆装顺序错乱。
-        # _cancel_audio_handoff() 会把在飞的旧实例一并处理掉，之后这里
-        # 关掉的才是"当前这一个"。
-        self._cancel_audio_handoff()
-        self._close_audio_player()
+        # 处理旧的音频播放器 —— 【第 15 轮·重写】不再同步 close_player()
+        #
+        # 原来这里是 _cancel_audio_handoff() + _close_audio_player()，后者会调
+        # close_player() 等读线程退出：实测 **440~810ms**（中位数其实只有 0.2ms
+        # —— 只有"上一个视频有音轨且真的在播"时才这么慢），而每点一次列表就卡
+        # 一次。实测连续切换 8 次共 1565ms，其中 1304ms（83%）花在这一句上。
+        #
+        # 现在改走"先建后关"，拆成两步（中间隔着"建新播放器"，顺序不能变）：
+        #   ① _cancel_audio_handoff(join=False)：作废在飞的交接 —— 这是必须的，
+        #      那次交接里可能还有一个旧实例等着被关，不作废就会和新流程抢同一个
+        #      实例。join=False 是因为退场线程关的东西主线程已经放手了，等它
+        #      只是白卡（连续换文件时这个"白等"会一次次叠加）。
+        #   ② _detach_audio_player()：摘下当前实例并立刻止声，但**不关**。
+        self._cancel_audio_handoff(join=False)
+        old_audio = self._detach_audio_player()
 
         # 【P1】播放状态先就位：音频播放器必须按"当前速率/暂停/静音"来创建，
         # 否则换速率后重新打开文件又会退回 1.0x。
@@ -1335,7 +1350,13 @@ class VideoPlayerApp:
         self.btn_play.config(text="暂停")
 
         # 创建新的音频播放器（与视频同一文件，从 0 秒开始）
+        # ⚠️ 必须赶在**旧实例还活着**的时候建（上面只是摘下、并没有关）——
+        # "先建后关"是硬约束：旧实例还占着一条混音通道，SDL 混音器才不会被销毁，
+        # 随后对新播放器调 set_volume 才安全（见 _apply_volume_now 的实测）。
         self.audio_player = self._create_audio_player(file_path, 0.0)
+        # 【第 15 轮·修复】新的已就位，现在才把旧的交出去 —— 它会被留到
+        # "新播放器的音频确认在跑"之后，再由后台线程关掉（见 _retire_audio_player）。
+        self._retire_audio_player(old_audio)
 
         fps = self.cap.get(cv2.CAP_PROP_FPS)
         self.video_fps = fps if fps > 0 else 30.0
@@ -2027,6 +2048,10 @@ class VideoPlayerApp:
         self.conversion_frame.grid_remove()
         self.root.config(cursor="none")
         self._controls_visible = False
+        # 【第 15 轮·新】播放列表栏也是"控件"，跟着一起收 —— 全屏下右边还挂着
+        # 一条 236px 的列表栏就不叫全屏了。它比底栏多一步：还要把第 1 列的
+        # 宽度约束归零，否则视频区右边会留一条空带（见那个方法）。
+        self._sync_playlist_visibility()
         # 不需要手动 render，video_container 尺寸变化会通过 Configure 事件自动触发
 
     def _show_controls(self):
@@ -2041,6 +2066,9 @@ class VideoPlayerApp:
         # 【P2 修复】原来这里无条件恢复视差栏：2D 模式下它根本没有作用，却
         # 照样被显示出来。改由 _sync_parallax_visibility 按当前模式决定。
         self._sync_parallax_visibility()
+        # 【第 15 轮·新】列表栏同理，只按"用户的意愿"决定要不要一起唤回来 ——
+        # 用户自己点过"隐藏列表"的话，晃一下鼠标不该把它强行拉出来。
+        self._sync_playlist_visibility()
         # 同样不需要手动 render
 
     def _sync_parallax_visibility(self):
@@ -2055,6 +2083,30 @@ class VideoPlayerApp:
             self.parallax_frame.grid_remove()
         else:
             self.parallax_frame.grid()
+
+    def _sync_playlist_visibility(self):
+        """按「用户的意愿 + 这一刻该不该显示控件」决定右侧列表栏的显隐。
+
+        两个条件**都**成立才显示：
+
+          · `_playlist_visible` —— 用户的意愿（"隐藏列表"按钮切换的那个开关）；
+          · `_controls_visible` —— 当前不在"全屏自动隐藏"那一段里。
+
+        【第 15 轮·新】在这之前只看第一个条件，于是全屏下鼠标一停、底栏收起来了，
+        右边却还挂着一条 236px 的列表栏 —— 全屏等于白叫。现在把两个条件拆开：
+        "用户想不想看列表"和"这一刻该不该显示控件"互不干扰。
+        全屏自动隐藏期间不显示；鼠标一晃唤回控件时，只有用户没主动关过列表，
+        它才跟着回来。
+
+        隐藏时**必须连第 1 列的 minsize 一起归零** —— `grid_remove` 只是
+        "不管理这个控件"，列宽约束还在，视频区右边会留下一条 236px 的空带。
+        """
+        if self._playlist_visible and self._controls_visible:
+            self.playlist_frame.grid()
+            self.root.grid_columnconfigure(1, minsize=PLIST_MIN_WIDTH)
+        else:
+            self.playlist_frame.grid_remove()
+            self.root.grid_columnconfigure(1, minsize=0)
 
     def _on_mouse_move(self, event=None):
         """全屏下鼠标移动 → 显示底栏 + 重置隐藏计时。
@@ -2567,12 +2619,17 @@ class VideoPlayerApp:
     # 统一收敛到 _restart_audio_at()。
     # ============================================================
     def _close_audio_player(self):
-        """安全关闭并清空音频播放器
+        """**同步**关闭并清空音频播放器（会等读线程退出，≈0.4~0.8 秒）。
 
         注意：**不要在后台音频交接进行中调用** —— 交接期间旧实例可能还留在
         _audio_handoff_old / 工作线程手里，先关当前这个会把混音器拆掉，
-        让那次交接里的抢发音量撞上已销毁的混音器。换文件 / 关窗前必须先
+        让那次交接里的抢发音量撞上已销毁的混音器。调用前必须先
         _cancel_audio_handoff()。
+
+        【第 15 轮·新】它现在**只剩关窗路径**在用了（on_close 里那一次：
+        进程要退出了，同步等干净是应该的）。换文件改走
+        `_detach_audio_player()` + `_retire_audio_player()` —— 那条路径
+        不能同步等（每点一次列表就卡 0.4~0.8 秒）。
         """
         if self.audio_player is not None:
             try:
@@ -2788,12 +2845,7 @@ class VideoPlayerApp:
         # 被销毁），从这一刻起不再对播放器下发音量 —— 后续由校准点那条路负责。
         self._audio_volume_resume = False
         self._stop_volume_resume_poll()
-        thread = threading.Thread(
-            target=self._audio_handoff_worker, args=(old,),
-            name="audio-handoff", daemon=True,
-        )
-        self._audio_handoff_thread = thread
-        thread.start()
+        self._spawn_audio_retire(old)
         self._schedule_audio_handoff_poll()
 
     def _audio_handoff_worker(self, old):
@@ -2812,6 +2864,48 @@ class VideoPlayerApp:
                 old.close_player()
             except Exception:
                 pass
+
+    def _spawn_audio_retire(self, old):
+        """起一个后台线程关掉旧播放器 `old`，并登记下来（关窗时有界地 join）。
+
+        统一的出口：`_cancel_audio_handoff` 与 `_poll_audio_handoff_ready`
+        原来各自起一遍线程，现在都走这里 —— 免得漏登记，或者将来只改了其中
+        一处。顺带把已经结束的线程从列表里剔掉，否则连点几十次文件会把列表
+        一直撑大。
+        """
+        if old is None:
+            return None
+        thread = threading.Thread(
+            target=self._audio_handoff_worker, args=(old,),
+            name="audio-retire", daemon=True,
+        )
+        self._audio_retire_threads = [t for t in self._audio_retire_threads
+                                      if t.is_alive()]
+        self._audio_retire_threads.append(thread)
+        self._audio_handoff_thread = thread      # 兼容既有的"交接线程"判据
+        thread.start()
+        return thread
+
+    def _join_audio_retire(self, timeout):
+        """有界地等待所有"关旧播放器"的后台线程结束（关窗 / 换文件时用）。
+
+        总预算是 `timeout` 秒，**不是每个线程各等这么久** —— 连续换了好几次
+        文件时可能有多个退场线程在飞，等不起随次数线性增长。
+
+        等不到就放弃：它们是 daemon，进程退出时随之一并结束；而且此刻主线程
+        手上已经没有任何播放器实例，不存在"两个 SDL 音频设备并存"的问题。
+        """
+        deadline = time.time() + max(0.0, float(timeout))
+        for t in list(self._audio_retire_threads):
+            remain = deadline - time.time()
+            if remain <= 0:
+                break
+            try:
+                t.join(remain)
+            except Exception:
+                pass
+        self._audio_retire_threads = [t for t in self._audio_retire_threads
+                                      if t.is_alive()]
 
     def _schedule_audio_handoff_poll(self):
         if self._audio_handoff_poll_id is not None:
@@ -2879,13 +2973,21 @@ class VideoPlayerApp:
             self._pending_audio_pos = None
             self._begin_audio_handoff(pos)
 
-    def _cancel_audio_handoff(self, timeout=2.0):
-        """作废并等待正在进行的音频交接（换文件 / 关窗时必须先调用）。
+    def _cancel_audio_handoff(self, timeout=2.0, join=True):
+        """作废正在进行的音频交接（换文件 / 关窗前必须先调用）。
 
-        两种"在飞"的状态都要收：① 旧播放器已经交给工作线程在关 —— join 它；
-        ② 旧播放器还留在 _audio_handoff_old 里等着"新播放器音频就绪"——
-        这里不等了，直接把它交给工作线程关掉。等待都是有界的：超时就放弃
-        （daemon 线程，进程退出即止），因为此后主线程已经不再持有那个实例。
+        两种"在飞"的状态都要收：① 旧播放器已经交给工作线程在关；
+        ② 旧播放器还留在 `_audio_handoff_old` 里等着"新播放器音频就绪"——
+        这里不等了，直接把它交给工作线程关掉。此后再没有人持有那个实例。
+
+        `join=True`（默认）会在 `timeout` 秒内等退场线程结束 —— **关窗时要这个**，
+        否则进程退出时还有线程在拆 SDL 音频设备。等待有界：超时就放弃
+        （daemon 线程，随进程退出）。
+
+        【第 15 轮·改】换文件走 `join=False`。那里**不需要等**：退场线程关的是
+        一个主线程已经完全放手的实例，等它只是白卡主线程 —— 而连续换文件时
+        这个"白等"会一次叠一次，正是"连点几下就一顿一顿"的第二个来源
+        （第一个是同步 close_player，见 open_video 里的说明）。
         """
         self._cancel_audio_handoff_poll()
         self._audio_volume_resume = False       # 抢发窗口即刻关闭
@@ -2895,21 +2997,76 @@ class VideoPlayerApp:
         old = self._audio_handoff_old
         self._audio_handoff_old = None
         if old is not None:
-            thread = threading.Thread(
-                target=self._audio_handoff_worker, args=(old,),
-                name="audio-handoff", daemon=True,
-            )
-            self._audio_handoff_thread = thread
-            thread.start()
+            self._spawn_audio_retire(old)
 
-        thread = self._audio_handoff_thread
-        if thread is not None:
-            try:
-                thread.join(timeout)
-            except Exception:
-                pass
+        # 交接就此作废：_audio_handoff_thread 归 None 表示"没有交接在进行"，
+        # update_frame 的每帧兜底（挂起的重建请求）因此重新放行。
+        # 线程本身仍登记在 _audio_retire_threads 里，关窗时等得到。
         self._audio_handoff_thread = None
         self._audio_handoff_pending = False
+        if join:
+            self._join_audio_retire(timeout)
+
+    # ============================================================
+    # 【第 15 轮·修复】换文件时的音频"先建后关"
+    # ------------------------------------------------------------
+    # 打开新视频原来是这样：同步 close_player() → 建新播放器。
+    # close_player() 要等读线程退出，实测 440~810ms（中位数其实只有 0.2ms ——
+    # 只有"上一个视频有音轨且真的在播"时才这么慢），于是每点一次列表就卡一次。
+    # 现在拆成两半：先摘下并止声（不阻塞）→ 建新播放器 → 旧的交出去，等新播放器
+    # 的音频确认在跑之后由后台线程关。顺序不能反，"先建后关"是硬约束
+    # （见 _apply_volume_now 的段错误分析）。
+    # ============================================================
+    def _detach_audio_player(self):
+        """把当前音频播放器"摘下来"并立刻止声（**不阻塞**），返回被摘下的实例。
+
+        这是"先建后关"的前半步：摘掉引用但**不关它** —— 此刻新播放器还没建，
+        现在关掉会销毁 SDL 混音器，随后对新播放器调 set_volume 就是段错误
+        （读 NULL+0x18，见 _apply_volume_now）。调用方必须在**建好新播放器之后**
+        调 `_retire_audio_player(old)` 收尾。
+
+        顺手做两件事：
+          ① `set_pause(True)` 立刻止声 —— 旧实例还要活几百毫秒，不能指望它自己
+             停（换文件时新旧声音叠在一起会很明显）；这一步安全且便宜。
+          ② `_mark_audio_live()` —— "当前没有播放器"了，"为拖动挂起"的豁免
+             不该跨文件残留（与 _close_audio_player 里那句同理）。
+        """
+        old = self.audio_player
+        self.audio_player = None
+        if old is not None:
+            try:
+                old.set_pause(True)
+            except Exception:
+                pass
+        self._mark_audio_live()
+        return old
+
+    def _retire_audio_player(self, old):
+        """换文件后把摘下来的旧播放器交出去 —— 等新播放器音频确认在跑，再后台关。
+
+        【为什么不在这里直接起线程关】关掉最后一个占着混音通道的播放器会销毁
+        SDL 混音器，此后 `set_volume` 就可能段错误。所以旧的必须一直活到
+        "新播放器的音频通道确认建立"为止 —— 这正是 `_audio_handoff_old` 的语义，
+        于是这里复用同一套机制，不另造一套状态：
+
+            _retire_audio_player → _audio_handoff_old 有值
+                → update_frame 每帧问 _poll_audio_handoff_ready
+                → 新音频确认在跑（或确认没音轨 / 超时兜底）
+                → _spawn_audio_retire 后台关，_poll_audio_handoff 收尾
+
+        这样做还顺带得到两个本来就有的一致行为：这期间墙钟接管画面
+        （`_audio_handoff_pending`），以及"交接期间来的跳转请求会被补上"。
+        """
+        if old is None:
+            return
+        if self._audio_handoff_old is not None:
+            # 理论上到不了这里（调用前刚 _cancel_audio_handoff 清过）。
+            # 真撞上就起线程关掉它 —— 不能被顶掉：没人关的播放器会一直占着
+            # 混音通道，后面所有 set_volume 的判据都会失准。
+            self._spawn_audio_retire(self._audio_handoff_old)
+        self._audio_handoff_old = old
+        self._audio_handoff_started = time.time()
+        self._audio_handoff_pending = True
 
     # ============================================================
     # 【P1 修复 2】音频重建的"请求 / 合并 / 挂起"
