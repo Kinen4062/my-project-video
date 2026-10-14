@@ -3,6 +3,7 @@ import sys       # 【P2】退出前冲刷输出缓冲
 import shutil  # 用于复制文件
 import tempfile  # 【P1】转换产物落到系统临时目录，不再污染工作目录
 import uuid      # 【P1】每次转换生成唯一临时文件名，避免互相覆盖
+import subprocess  # 【第 11 轮】调用 ffmpeg 把原音轨补回转换产物
 
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
@@ -53,15 +54,73 @@ BTN_SUCCESS = dict(
     relief=tk.FLAT, bd=0, padx=8, pady=4,
 )
 
-# 【P1 修复】空格键冲突控件清单
-# 这些控件自身就以空格键为原生操作（按钮被激活、输入框/列表输入空格等），
-# 焦点落在它们上面时，全局的"空格=播放/暂停"必须让路，
-# 否则一次按键会同时触发按钮动作和播放切换。
-SPACE_CONFLICT_WIDGETS = (
-    tk.Button, tk.Entry, tk.Text, tk.Listbox,
-    ttk.Button, ttk.Entry, ttk.Combobox,
-    ttk.Checkbutton, ttk.Radiobutton,
+# ============================================================
+# 全局快捷键的"让路"规则
+# ============================================================
+# 原则只有一条：**只有当这个键在该控件上真的有原生含义时才让路**。
+# 让路过多 = 快捷键变成哑巴，这比"偶尔双重动作"更严重 —— 2026-10-13 栽过一次：
+# 原来 ARROW_CONFLICT_WIDGETS = SPACE_CONFLICT_WIDGETS + (Scale, Scale)，
+# 把 Button / Combobox 一并算进了"方向键冲突"，于是**只要点过任意一个按钮或下拉框，
+# ←/→/J/L/M/F 就全部失灵**。用户报的正是"空格/K/←/→/J/L/M/F 全都没反应"。
+#
+# 所以规则写成"控件类型 → 该控件真正会吃的键"的有序表，**逐键判断**。
+# 一条铁律：不能用"这个控件是冲突控件"一概而论 —— 一个控件常常只吃一部分键
+# （下拉框吃方向键却完全不吃字母键）。
+#
+# 下面每条都实测定过，不是照抄 Tk 文档推断的。
+
+_ARROW_KEYS = ("left", "right", "up", "down")
+_ALL_SHORTCUT_KEYS = _ARROW_KEYS + ("space", "m", "f", "j", "k", "l")
+
+# 真正"要打字"的控件：空格打空格、方向键移光标、字母变输入内容 → 全让。
+TEXT_INPUT_WIDGETS = (tk.Entry, ttk.Entry, tk.Text)
+
+# ⚠️ 顺序有意义，**第一个类型匹配上的规则就是定论**：
+#    该控件吃哪些键写在它的集合里，不在这集合里的键一律不让路。
+#    不能写成"没匹配上就继续往下找" —— 那样 ttk.Combobox（它是 ttk.Entry 的
+#    子类）会掉进下面那条更宽的"输入框全让路"里，空格和字母键就又被吞掉了。
+KEY_YIELD_RULES = (
+    # 只读下拉框：实测**列表关着**的时候只有 ↓ 有真实动作（弹出候选列表），
+    # ←/→/↑ 一概改不动它的值、空格也不弹不改。规则表里先按"让方向键"记，
+    # 再由 `_shortcut_should_yield()` 里的例外按"列表开着/关着"细分。
+    # 这条必须排在最前面：**ttk.Combobox 是 ttk.Entry 的子类**
+    # （isinstance 对 Entry 也成立）。排后面就会被"输入框全让路"吞掉 ——
+    # 焦点在一次下拉框选择之后落到下拉框上，空格和字母键就全哑了，
+    # 正是用户报的那个现象。这个坑是让路矩阵测试当场抓出来的。
+    (ttk.Combobox, _ARROW_KEYS),
+    # 真正"要打字"的控件：空格打空格、方向键移光标、字母变输入内容 → 全让。
+    (TEXT_INPUT_WIDGETS, _ALL_SHORTCUT_KEYS),
+    # 滑块：实测 ←/→/↑/↓ 调值。空格和字母一概不吃。
+    ((tk.Scale, ttk.Scale), _ARROW_KEYS),
+    # 列表：方向键移动选中、空格选中当前项。
+    ((tk.Listbox,), _ARROW_KEYS + ("space",)),
+    # 按钮/复选/单选：Tk 的类绑定会把空格绑到"激活自己"上。
+    #
+    # 按钮这一档实际已经被 __init__ 里的 bind_class 替换掉了（空格在按钮上
+    # 直接就是播放/暂停），所以这里更多是**兜底**：万一将来有哪个按钮类没被
+    # bind_class 覆盖到，至少还知道"空格要留给它"，不会出现双重动作。
+    # ⚠️ 刻意只有 "space"：把按钮算进方向键让路，就是那个 bug 的根源。
+    ((tk.Button, ttk.Button, tk.Checkbutton, ttk.Checkbutton,
+      tk.Radiobutton, ttk.Radiobutton), ("space",)),
 )
+
+
+def should_yield_shortcut(widget, key):
+    """这个按键要不要让给这个控件自己处理？
+
+    `key` 用 Tk 的 keysym 小写形式（"left"/"space"/"m"…）。
+    **第一个类型匹配上的规则就是定论** —— 顺序有意义，见 KEY_YIELD_RULES 的注释。
+    """
+    if widget is None:
+        return False
+    for types_, keys in KEY_YIELD_RULES:
+        if isinstance(widget, types_):
+            return key in keys
+    return False
+
+# 【第 11 轮·新】键盘快捷键的步长
+VOLUME_KEY_STEP = 0.05        # ↑/↓ 每按一次改变的音量（0~1）
+SHORTCUT_SEEK_STEP_SEC = 10.0  # J/L 每按一次快退/快进的秒数
 
 # 【P1 修复】音频"跳转"为什么只能用重建播放器，而不能用 seek()：
 # 实测本构建 ffpyplayer（ffpyplayer 自带 ffmpeg）得到的三条结论：
@@ -183,6 +242,96 @@ MOTION_THROTTLE_MS = 100
 # 删掉写到一半的临时文件，然后才强制退出进程。
 CONVERSION_JOIN_TIMEOUT_SEC = 1.0
 
+# ============================================================
+# 【第 11 轮·新】转换产物补回音轨
+# ------------------------------------------------------------
+# 背景：`process_video_to_3d` 用 `cv2.VideoWriter` 写 3D 产物，而它**只写视频流**
+# —— 转换出来的文件**没有音轨**。用户体感是"视频一转成 3D 就没声音了"。
+# （也正因如此，本程序为"无音轨文件"准备了一整套兜底：死时钟检测、墙钟主时钟、
+#   永不调 set_volume —— 那些逻辑仍然要保留，因为用户完全可能打开别的无声文件。）
+#
+# 对策：转换收尾时调一次 ffmpeg，把**原视频的音轨**并进产物。视频流走
+# `-c:v copy`（不重编码），所以只多花一两秒。
+#
+# 为什么必须多路径查找、还要能优雅降级：
+#   本机唯一一份 ffmpeg 在 ffpyplayer 的 wheel 里
+#   （`.venv/share/ffpyplayer/ffmpeg/bin/ffmpeg.exe`），**不在 PATH 上**；
+#   而且只有 FULL-BUILD 轮子才带它，别的机器装了 ffpyplayer 未必有。
+#   ⇒ 找不到就**静默降级**为无声产物（转换本身绝不因此失败），只在控制台说明一句。
+# ============================================================
+FFMPEG_MUX_TIMEOUT_SEC = 300      # 单次 mux 的超时；超时即放弃音轨（大文件也够）
+FFMPEG_AUDIO_BITRATE = "160k"     # 音轨重新编码成 aac 的码率（原轨可能是任意格式）
+
+_FFMPEG_PATH = None      # 缓存：""=找过但没有；其它=可执行文件路径
+_FFMPEG_SEARCHED = False
+
+
+def find_ffmpeg():
+    """找一个可用的 ffmpeg 可执行文件；找不到返回 None。
+
+    调用方（`_mux_audio_into_video` / 测试套件）**必须**处理 None 的情况。
+    搜索结果会缓存，所以可以放心地在热路径外反复调用。
+    """
+    global _FFMPEG_PATH, _FFMPEG_SEARCHED
+    if _FFMPEG_SEARCHED:
+        return _FFMPEG_PATH or None
+    _FFMPEG_SEARCHED = True
+
+    exe = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    cands = []
+    env = os.environ.get("FFMPEG_BINARY")           # ① 显式指定的优先
+    if env:
+        cands.append(env)
+    which = shutil.which("ffmpeg")                  # ② PATH
+    if which:
+        cands.append(which)
+    # ③ ffpyplayer 的 FULL-BUILD 轮子里自带一份（本机就是靠这条找到的）
+    proj_root = os.path.dirname(os.path.abspath(__file__))
+    for base in (sys.prefix, proj_root):
+        for sub in (("share", "ffpyplayer", "ffmpeg", "bin"),
+                    (".venv", "share", "ffpyplayer", "ffmpeg", "bin")):
+            cands.append(os.path.join(base, *sub, exe))
+    try:                                            # ④ imageio-ffmpeg 自带的
+        import imageio_ffmpeg
+        cands.append(imageio_ffmpeg.get_ffmpeg_exe())
+    except Exception:
+        pass
+
+    for c in cands:
+        try:
+            if c and os.path.isfile(c):
+                _FFMPEG_PATH = c
+                return c
+        except Exception:
+            continue
+    _FFMPEG_PATH = ""
+    return None
+
+
+def has_audio_stream(ffmpeg, path):
+    """判断媒体文件里有没有音轨。
+
+    用 `ffmpeg -i` 的 stderr 里有没有 "Audio:" 字样来判断，**不依赖 ffprobe**
+    （ffpyplayer 那份 wheel 里只有 ffmpeg.exe，没有 ffprobe.exe）。
+    注意：`ffmpeg -i xxx` 不带输出参数时退出码就是 1，属正常，不能拿退出码判断。
+    """
+    try:
+        proc = subprocess.run([ffmpeg, "-hide_banner", "-i", path],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                              timeout=60)
+    except Exception:
+        return False
+    return b"Audio:" in (proc.stderr or b"")
+
+
+def _remove_quietly(path):
+    """删文件，失败不抛异常（临时文件清理到处都要用）"""
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
 
 class PlayState:
     """【P2 修复】播放状态。
@@ -293,6 +442,17 @@ class VideoPlayerApp:
         # 【关键】监听容器尺寸变化，底栏显隐/窗口缩放都会触发重绘
         self.video_container.bind("<Configure>", self.on_window_resize)
 
+        # 【第 11 轮·修正 2】点一下画面 = 把键盘焦点收回主窗口。
+        #
+        # 为什么需要这个：焦点一旦被按钮/滑块/下拉框拿走，那些"在该控件上确实有
+        # 原生含义"的键就会让路（见 KEY_YIELD_RULES 的说明）。这是刻意保留
+        # 的取舍（否则滑块会和步进抢方向键），但必须给用户一个**一眼能想到的恢复
+        # 动作**，不能让人以为"快捷键坏了"。
+        # 点画面是最自然的选择：用户本来就在看画面。
+        # （tk.Label / tk.Frame 的 takefocus 默认是 0，所以点它不会反过来抢走焦点。）
+        for _w in (self.video_container, self.video_label):
+            _w.bind("<Button-1>", self._restore_shortcut_focus)
+
         self.progress_frame = tk.Frame(self.root, bg=DARK_BG)
         self.progress_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=5)
 
@@ -373,6 +533,12 @@ class VideoPlayerApp:
         tk.Button(self.btn_frame, text="导出3D视频",
                   command=self.export_3d_video, **BTN_SUCCESS).pack(side=tk.LEFT, padx=5, pady=10)
 
+        # 【第 11 轮·新】快捷键提示入口。放最右边，不挤占主操作区
+        # （这一行本来就偏满，见 P2 记录里关于底栏拥挤的说明）。
+        tk.Button(self.btn_frame, text="快捷键 (F1)",
+                  command=self.show_shortcuts,
+                  **BTN_NORMAL).pack(side=tk.RIGHT, padx=5, pady=10)
+
         # ---------- row 3：设置项 ----------
         tk.Label(self.aux_frame, text="3D模式:", bg=DARK_BG, fg=DARK_FG).pack(side=tk.LEFT, padx=(5, 5))
         mode_combo = ttk.Combobox(
@@ -425,8 +591,53 @@ class VideoPlayerApp:
         )
         self.btn_swap_eyes.pack(side=tk.LEFT, padx=5)
 
-        self.root.bind("<space>", self._on_space_key)
-        self.root.bind("<F11>", self.toggle_fullscreen)
+        # 【第 11 轮·修正】这几条全局键一律用 **bind_all**，不用 root.bind。
+        #
+        # 为什么必须改：Tk 的 widget 绑定只在"事件投递到的那个控件就是 root
+        # 自己"时才触发。用户点过按钮/滑块/下拉框之后，焦点就留在那个子控件上，
+        # 事件投给子控件 → root 的绑定**根本不执行** → 所有全局快捷键集体失灵
+        # （空格早在第 1 轮就有这个毛病，只是一直没人点到按钮后再按空格）。
+        # bind_all 注册在 bindtags 最后一级 "all" 上，任何控件的事件都会轮到它。
+        #
+        # 代价与对策：处理器在子控件之后执行，所以"抢键"造成的双重动作无法靠
+        # 返回 "break" 撤销，只能在处理器**内部**判断该不该让路 —— 判据集中在
+        # 下面的 KEY_YIELD_RULES（逐键），改造前那套"清单"就是在这里失效的。
+        self.root.bind_all("<space>", self._on_space_key)
+        self.root.bind_all("<F11>", self.toggle_fullscreen)
+
+        # 【第 11 轮·修正 2】把"空格=播放/暂停"从按钮手里彻底拿回来。
+        #
+        # 背景：Tk 的 Button 类默认把 `<space>` 绑到"激活这个按钮"上；而按钮被
+        # 鼠标点过之后焦点就留在它身上（Tk 的按钮类绑定会 `focus` 自己）。
+        # 于是"点一下打开视频 → 按空格想播放"变成了**重新弹出文件选择框** ——
+        # 用户看到的就是"空格没反应"。实测确认过：焦点在按钮上按空格，按钮的
+        # command 会真的执行（复现脚本还因此卡在模态文件框上）。
+        #
+        # 为什么不用"让路"那套：让路只能让我们的处理器**不执行**，撤不掉按钮已经
+        # 发生的动作（bind_all 是 bindtags 最后一级）。所以要换掉类绑定 —— 放在
+        # class 这一级，**在 "all" 之前**执行，直接做事并返回 "break"，
+        # 按钮那条原生绑定根本不会跑，双重动作从源头消失。
+        #
+        # 代价：键盘用户不能再"Tab 到按钮再按空格激活"。本程序是鼠标驱动的播放器，
+        # 而空格=播放/暂停的一致性是用户第一直觉，这个取舍划算。
+        # （回车键仍然能激活按钮 —— Tk 给 Button 还绑了 <Return>，没有动它。）
+        for _cls in ("Button", "TButton"):
+            self.root.bind_class(_cls, "<space>", self._on_button_space)
+
+        # 【第 11 轮·新】键盘快捷键。原来只有空格（播放/暂停）和 F11（全屏），
+        # 连最基本的"逐帧看"、"调音量"都得去摸鼠标。这里逐个 keysym 绑到同一个
+        # 入口：一是好维护，二是"焦点冲突"只需要在一处判断（见 _on_key_shortcut）。
+        for seq in ("<Left>", "<Right>", "<Up>", "<Down>",
+                    "<Key-m>", "<Key-f>", "<Key-j>", "<Key-k>", "<Key-l>"):
+            self.root.bind_all(seq, self._on_key_shortcut)
+        self.root.bind_all("<F1>", self.show_shortcuts)
+
+        # 【第 11 轮·修正 2】窗口重新拿到焦点时兜一道底。
+        # Tk 的键盘事件只交给"当前焦点窗口"，**焦点窗口为空时按键全部被丢弃**
+        # （连 bind_all 都收不到）。窗口刚创建、或被别的窗口抢走再还回来时，
+        # Tk 内部的焦点窗口可能是空的 —— 那就会表现成"所有快捷键都没反应"。
+        # 这时把它落到主窗口上即可；已经在某个控件上就不动（别打断输入框）。
+        self.root.bind("<FocusIn>", self._ensure_keyboard_focus)
 
         # 【P2 修复】缩放重绘只由 video_container 的 <Configure> 驱动
         # （见 on_window_resize 的说明），不再重复绑 root。
@@ -477,6 +688,12 @@ class VideoPlayerApp:
         # 推迟音量同步的重试时刻（见 _apply_volume_now：没确认"音频真的在跑"就不调
         # set_volume，隔 AUDIO_VOLUME_SYNC_DELAY 再试）
         self._audio_volume_sync_at = 0.0
+        # 【第 11 轮修复】"音频是为拖动而挂起的，还没被交给新播放器"。
+        # 拖动时 _suspend_audio_for_seek 会把音频 set_pause(True)，这段时间它的
+        # pts 是冻住的 —— **不能**拿它去判"死时钟"（否则连续快速拖动会被误判成
+        # "这个文件没有音轨"，见 _audio_clock_media_seconds 的提前返回）。
+        # 音频一被重建/恢复就解除（_mark_audio_live）。
+        self._audio_suspended_for_seek = False
         # 【本次修复】"抢发音量"窗口：交接刚开始的那几百毫秒里，旧播放器还占着
         # SDL 混音通道（所以混音器必然有效），可以放心地对新播放器反复调
         # set_volume —— 于是音量能在它出声**之前**就位。没有这段窗口的话，新播放器
@@ -493,6 +710,9 @@ class VideoPlayerApp:
         # 导出按钮只认这个字段，不再靠"工作目录里碰巧有个同名文件"来判断，
         # 避免用【打开已有3D视频】载入别的文件后导出上一次的残留产物。
         self.session_output_path = None
+        # 【第 11 轮·新】上一次转换产物有没有成功补上音轨（给完成提示用，见
+        # _mux_audio_into_video —— cv2.VideoWriter 不写音轨，转换收尾要补一次）
+        self._last_output_has_audio = False
 
         # 音频对齐相关：见 _restart_audio_at() 的说明。
         # 本构建的 ffpyplayer 只能靠"重建播放器 + ss"定位音频，
@@ -716,6 +936,8 @@ class VideoPlayerApp:
         self._silent_clock_base = None      # 换了文件，墙钟主时钟重新对表
         self._last_media_sec = 0.0          # 音频交接用的"当前视频位置"也归零
         self.audio_failed = False  # 换文件后允许重试一次音频
+        # 【第 11 轮修复】换了文件，"为拖动挂起"的豁免不能跨文件残留
+        self._mark_audio_live()
         self.btn_play.config(text="暂停")
 
         # 创建新的音频播放器（与视频同一文件，从 0 秒开始）
@@ -729,6 +951,11 @@ class VideoPlayerApp:
         self.seek_var.set(0)
 
         self.update_frame()
+
+        # 【第 11 轮·修正 2】刚选完文件的用户，下一个动作几乎一定是播放/暂停。
+        # 而此刻焦点还留在"打开视频"那个按钮上 —— 空格会被按钮吃掉（重新打开
+        # 文件对话框），"按空格没反应"的观感就是这么来的。这里主动把焦点收回来。
+        self._restore_shortcut_focus()
 
     def start_conversion(self):
         if self.is_converting:
@@ -863,6 +1090,12 @@ class VideoPlayerApp:
                 self._cleanup_partial_output(output_path)
                 self.root.after(0, self._on_conversion_cancelled)
             else:
+                # 【第 11 轮·新】把原视频的音轨补回产物。
+                # cv2.VideoWriter 只写视频流 → 不补的话用户会得到一段无声的 3D 视频。
+                # 失败不影响转换结果（拿到的仍是能播的无声文件），所以不看返回值
+                # 决定成败，只记下来给完成提示用。
+                self._last_output_has_audio = self._mux_audio_into_video(
+                    output_path, input_path)
                 self.root.after(0, self.on_conversion_done, output_path)
 
         except Exception as e:
@@ -900,6 +1133,68 @@ class VideoPlayerApp:
                 os.remove(output_path)
         except Exception as e:
             print(f"删除临时文件失败: {e}")
+
+    def _mux_audio_into_video(self, video_path, audio_source_path):
+        """把 `audio_source_path` 的音轨并入 `video_path`（**原地替换**）。
+
+        【第 11 轮·新】`cv2.VideoWriter` 只写视频流，转换产物天生没有音轨
+        （症状："视频转成 3D 之后就没声音了"）。这里在转换收尾补一次音轨。
+
+        返回 True = 音轨已并进去；返回 False = 没补（产物仍是可播放的无声文件）。
+        下面三种情况都走 False，且**一律不抛异常** —— 补音轨是锦上添花，
+        绝不能让它把整个转换搞失败：
+          ① 找不到 ffmpeg（多路径查找见模块级 `find_ffmpeg`）；
+          ② 源文件自己就没有音轨（没什么可补的）；
+          ③ ffmpeg 执行失败或超时。
+
+        实现要点：
+          - 视频流 `-c:v copy` 不重编码，只多花一两秒；
+          - 音轨统一重编码成 aac（原轨可能是任意格式/采样率，copy 进 mp4 未必合法）；
+          - `-shortest` 让音轨跟着视频长度收尾（音频比视频长时不会拖出静音尾巴）；
+          - 先写同目录临时文件再 `os.replace` 原子替换 —— 中途失败也不会毁掉
+            已经写好的无声产物。
+        """
+        ffmpeg = find_ffmpeg()
+        if ffmpeg is None:
+            print("未找到 ffmpeg，转换产物将不带音轨（视频本身不受影响）")
+            return False
+        if not has_audio_stream(ffmpeg, audio_source_path):
+            print("源视频没有音轨，无需补音轨")
+            return False
+
+        tmp_path = video_path + ".muxing.mp4"
+        cmd = [
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+            "-i", video_path, "-i", audio_source_path,
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", FFMPEG_AUDIO_BITRATE,
+            "-shortest",
+            tmp_path,
+        ]
+        try:
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE,
+                                  timeout=FFMPEG_MUX_TIMEOUT_SEC)
+        except Exception as e:
+            print(f"补音轨失败（ffmpeg 调用异常）: {e}")
+            _remove_quietly(tmp_path)
+            return False
+
+        if (proc.returncode != 0 or not os.path.exists(tmp_path)
+                or os.path.getsize(tmp_path) == 0):
+            detail = (proc.stderr or b"").decode("utf-8", "replace").strip()
+            print(f"补音轨失败（ffmpeg 退出码 {proc.returncode}）: {detail[-400:]}")
+            _remove_quietly(tmp_path)
+            return False
+
+        try:
+            os.replace(tmp_path, video_path)
+        except Exception as e:
+            print(f"补音轨失败（替换产物出错）: {e}")
+            _remove_quietly(tmp_path)
+            return False
+        return True
 
     def _update_conversion_progress(self, current, total, start_time):
         """在主线程更新进度条和文字"""
@@ -972,10 +1267,14 @@ class VideoPlayerApp:
         switch_3d = messagebox.askyesno(
             "转换完成",
             "3D 视频已生成（左右分屏格式）。\n\n"
+            "%s\n\n"
             "现在切换到【红蓝3D】模式吗？\n"
             "（需要戴红蓝眼镜才能看出立体感；选'否'则保持 2D 左右分屏显示）\n\n"
             "临时文件位置：\n%s\n\n"
-            "点【导出3D视频】可另存为正式文件。" % output_path
+            "点【导出3D视频】可另存为正式文件。"
+            % ("已保留原视频的音轨。" if self._last_output_has_audio else
+               "产物未包含音轨（没找到 ffmpeg，或源视频本身没有声音）。",
+               output_path)
         )
         if switch_3d:
             self.display_mode = "红蓝3D"
@@ -998,15 +1297,116 @@ class VideoPlayerApp:
         self._sync_parallax_visibility()
         self.render_current_frame()
 
+    def _event_target_widget(self, event):
+        """判断"这次按键实际是冲着哪个控件去的"，用于决定全局快捷键要不要让路。
+
+        【第 11 轮·修正】以前用 `self.root.focus_get()` 判断。改用 bind_all 之后
+        必须换掉，理由有两个：
+          1. `focus_get()` 在窗口没有系统焦点时**返回 None**（无人值守跑测试、
+             或被别的窗口挡住时就是这样），此时 isinstance 判断恒为 False
+             → 该让路的没让路 → 一次按键两个动作。而 `event.widget` 由 Tk 直接
+             写明，跟系统焦点无关。
+          2. `focus_get()` 给的是"焦点在谁身上"，`event.widget` 给的是"事件发给
+             了谁" —— 后者才是我们真正关心的（bind_all 收到的正是同一个事件）。
+        取不到 `event.widget` 时（例如直接调用处理器）才退回 focus_get()。
+        """
+        widget = getattr(event, "widget", None)
+        if widget is None:
+            widget = self.root.focus_get()
+        return widget
+
+    def _ensure_keyboard_focus(self, event=None):
+        """窗口重新获得焦点后，若 Tk 的焦点窗口是空的就把它落到主窗口上。
+
+        这不是可有可无的保险：Tk 的键盘事件只交给"当前焦点窗口"，**焦点窗口为空
+        时事件被直接丢弃**，`bind_all` 也收不到 —— 表现就是"所有快捷键都没反应"。
+        实测过：`tk.call("focus")` 为空串时，`event_generate` 出来的按键纹丝不动。
+
+        只在"空"的时候补，已经落在某个控件上就完全不动 —— 否则会把用户正在
+        输入框里打的字打断。
+        """
+        try:
+            if not self.root.tk.call("focus"):
+                self.root.focus_set()
+        except Exception:
+            pass
+
+    def _restore_shortcut_focus(self, event=None):
+        """点一下视频画面：把键盘焦点收回主窗口，让全局快捷键重新生效。
+
+        焦点被按钮/滑块/下拉框拿走之后，那些"在该控件上确实有原生含义"的键会
+        让路（方向键让给滑块、空格让给按钮）。这是刻意保留的取舍，但用户需要一个
+        一眼能想到的恢复动作 —— 点画面最自然，因为他本来就在看画面。
+        """
+        try:
+            self.root.focus_set()
+        except Exception:
+            pass
+
+    def _combobox_popdown_open(self, widget):
+        """这个下拉框的候选列表当前是弹出来的吗？
+
+        用 Tk 自己的 `ttk::combobox::PopdownWindow` 问，不猜。
+        （列表从没弹过时这个命令会顺手把 popdown 窗口建出来，`ismapped` 仍是 False。）
+        """
+        try:
+            popdown = widget.tk.call("ttk::combobox::PopdownWindow", widget)
+            return bool(widget.tk.call("winfo", "ismapped", popdown))
+        except Exception:
+            return False
+
+    def _shortcut_should_yield(self, target, key):
+        """最终裁决：这个键要不要让给 `target` 自己处理？
+
+        底座是 `should_yield_shortcut()`（那张有序规则表），再加**两个刻意的例外**。
+        例外之所以单独放在这里，是因为它们依赖"运行时状态/实例身份"，写不进
+        纯类型的规则表。
+        """
+        if target is None:
+            return False
+
+        if target is self.scale and key in _ARROW_KEYS:
+            # 例外一：进度条。
+            # 它虽然是 ttk.Scale，但语义上是"定位控件"而不是"参数控件"：F1 里写的
+            # 就是"←/→ 上一帧、下一帧"。让路给 ttk.Scale 的后果是"滑块只挪一小格，
+            # 而且键盘操作不触发 ButtonRelease —— 定位要等 500ms 的防抖定时器才
+            # 落地"（实测），既慢又不是逐帧，用户的观感就是"←/→ 没反应"。
+            # 音量/视差滑块照旧让路：它们的方向键动作立即且可见。
+            return False
+
+        if isinstance(target, ttk.Combobox) and key in _ARROW_KEYS:
+            # 例外二：下拉框。分两种状态，因为实测行为不一样：
+            #   · 候选列表**开着**：↑/↓/←/→ 都在浏览选项 → 全让。
+            #   · 候选列表**关着**：实测只有 ↓ 有真实动作（弹出列表），
+            #     ←/→/↑ 改不动它的值（无事发生）。
+            #     让路给一个"无事发生"的键 = 按键变哑巴，所以只让 ↓。
+            #     这一条直接决定用户会不会觉得"←/→ 没反应"：改完倍速之后焦点
+            #     就留在下拉框上，此时 ←/→ 必须归播放器（逐帧步进），
+            #     否则要么哑掉、要么**又改一次倍速**（每次改倍速要付 0.5 秒重建）。
+            if self._combobox_popdown_open(target):
+                return True
+            return key == "down"
+
+        return should_yield_shortcut(target, key)
+
+    def _on_button_space(self, event=None):
+        """按在按钮上的空格：仍然是播放/暂停，不是"激活这个按钮"。
+
+        这是**替换**掉 Tk 的 Button 类默认绑定（见 __init__ 里的 bind_class），
+        运行时机比 bind_all 早一级，所以返回 "break" 能真正阻止按钮被激活。
+        """
+        self.toggle_play()
+        return "break"
+
     def _on_space_key(self, event=None):
         """全局空格键：播放 / 暂停。
 
-        【P0 修复】先看焦点在哪：焦点落在按钮、下拉框、输入框这类
-        "空格有原生含义"的控件上时直接放行，交给控件自己处理，
-        避免出现"按钮被激活 + 播放状态被切换"的双重动作。
+        【P0 修复】先看事件落在哪个控件上：按钮/复选/单选/输入框/列表这些
+        "空格有原生含义"的控件要让路，交给它们自己处理，避免"按钮被激活 +
+        播放状态被切换"的双重动作。
+        让路与否**逐键**判断，依据是 `_shortcut_should_yield()`（规则表 + 两个例外）。
         """
-        focused = self.root.focus_get()
-        if isinstance(focused, SPACE_CONFLICT_WIDGETS):
+        if self._shortcut_should_yield(self._event_target_widget(event), "space"):
             return None
         self.toggle_play()
 
@@ -1036,6 +1436,9 @@ class VideoPlayerApp:
                         self.audio_player.set_pause(False)
                     except Exception:
                         pass
+            # 【第 11 轮修复】恢复播放 = 音频重新活过来，解除"为拖动挂起"的
+            # 死时钟豁免（暂停态拖动会把音频压住并留下这个标记）。
+            self._mark_audio_live()
             # 暂停期间的时间不能算进墙钟主时钟的账（否则一恢复就会被判成
             # "落后一大截"而狂丢帧），所以重新对表。
             self._silent_clock_base = None
@@ -1063,6 +1466,163 @@ class VideoPlayerApp:
             self._pending_audio_pos = self._current_video_seconds()
             return
         self._restart_audio_at(self._current_video_seconds())
+
+    # ============================================================
+    # 【第 11 轮·新】键盘快捷键
+    # ------------------------------------------------------------
+    # 原来只有空格（播放/暂停）与 F11（全屏）。补上播放器最基本的那几个：
+    #   ← / →      单帧后退 / 前进
+    #   ↑ / ↓      音量 ±5%
+    #   J / L      快退 / 快进 10 秒
+    #   K          播放/暂停（和 J/L 配套，Vim 习惯）
+    #   M          静音开关
+    #   F          全屏开关（F11 同义）
+    #   F1         在界面上列出这些快捷键
+    # ============================================================
+    def _on_key_shortcut(self, event=None):
+        """新增快捷键的统一入口。
+
+        纪律：**焦点落在"这个键在该控件上真的有原生含义"时才放行**。
+        判断是**逐键**的 —— 不能说"这个控件是冲突控件"，因为一个控件可能只吃
+        方向键而不吃字母键（只读下拉框就是：↓ 弹列表，但空格和 M/J/K/L/F 它一概不碰）。
+
+        判据集中在 `should_yield_shortcut()` / `KEY_YIELD_RULES`（实测得出）。
+        逐键判断这一点是被用户报的 bug 教出来的：原来靠一张清单走天下，
+        `ARROW_CONFLICT_WIDGETS` 把 Button / Combobox 都算进去了，于是**点过任意
+        按钮或下拉框之后，←/→/J/L/M/F 全部失灵**（用户原话："快捷键无反应"）。
+
+        返回 "break"（实测确认过）：bind_all 是 bindtags 的最后一级，返回
+        "break" 不会影响任何控件自身的处理（那一步早就做完了），但它会中止
+        "all" 这个标签上排在我们后面的其它绑定。真正防住双重动作的是上面那次
+        让路判断 —— 别让"步进一帧"和"滑块自己动一下"同时发生。
+        """
+        if self.cap is None:
+            return None
+
+        key = (event.keysym or "").lower()
+        if key not in _ALL_SHORTCUT_KEYS or key == "space":
+            return None
+
+        target = self._event_target_widget(event)
+        if self._shortcut_should_yield(target, key):
+            return None
+
+        if key in ("left", "right"):
+            self.step_frame(-1 if key == "left" else 1)
+        elif key in ("up", "down"):
+            self.step_volume(VOLUME_KEY_STEP if key == "up" else -VOLUME_KEY_STEP)
+        elif key == "m":
+            self.toggle_mute()
+        elif key == "f":
+            self.toggle_fullscreen()
+        elif key == "j":
+            self.nudge_position(-SHORTCUT_SEEK_STEP_SEC)
+        elif key == "l":
+            self.nudge_position(SHORTCUT_SEEK_STEP_SEC)
+        elif key == "k":
+            self.toggle_play()
+        else:
+            return None
+        return "break"
+
+    def _rebase_master_clock(self):
+        """把主时钟的零点挪到"当前的视频位置"。
+
+        手动改变播放位置（逐帧步进）之后必须调用，否则同步逻辑会在下一帧把
+        画面拽回原处 —— 看起来就是"按键没反应"：主时钟的零点还锚在跳转前的
+        位置，它算出的目标帧仍是旧的，而同步只会向前追（grab/丢帧），不会回头。
+
+        实现上只是把参考读数清空：下一次 `_audio_clock_media_seconds` 会用
+        "此刻的视频位置"重新建零点（这条路径本来就在，回绕/校准都走它）。
+        墙钟（无音轨文件）同理 —— 清掉基准即重新对表。
+        """
+        self._audio_progress_ref = None
+        self._silent_clock_base = None
+
+    def step_frame(self, delta):
+        """单帧步进（←/→）。播放态与暂停态都能用。
+
+        暂停态是主要用法（逐帧看 3D 效果的差别）：`cap.set` 之后必须带
+        `force=True` 重绘一帧 —— 复用第 8 轮那个修复，暂停态不会因为
+        is_playing 为 False 而提前 return。
+
+        几处刻意的取舍：
+          - **不做音频重建**。差一帧只有 ~40ms，远小于能察觉的音画错位；
+            而本构建重建一次要付 ~0.5 秒（后台交接），连按几下就一直在重建。
+            暂停态只把位置**登记**下来（_pending_audio_pos），恢复播放时统一对齐。
+          - 播放态下这一帧可能被主时钟同步"吸收"掉（同步只向前追），所以
+            想精确看某一帧就暂停后再按 —— 界面上给的提示也是这么写的。
+          - 播放态下按 → 的效果等于"立刻把下一帧显示出来"（那一帧本来 40ms 后
+            就要出现），按 ← 才是明显的后退一帧；想精确逐帧看就**先暂停**再按，
+            界面上给的提示也是这么写的。
+          - 位置用 `cap.get(POS_FRAMES)` 读，它给的是**下一帧的序号**（比正在
+            显示的那帧大 1 —— 这个坑在跳转那一段的注释里也写过）。
+            所以"从当前显示的这一帧走 delta 帧"要写成 `POS_FRAMES - 1 + delta`。
+        """
+        if self.cap is None or self.total_frames <= 1:
+            return
+        fps = self.video_fps if self.video_fps > 0 else 25.0
+        displayed = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+        target = self._clamp_seek_frame(displayed + delta)
+        if target == displayed:
+            return
+
+        self._cancel_seek_timer()
+        self.is_seeking = False
+        self._last_jump_frame = None        # 手动跳过了，作废"已渲染落点"的记录
+        self.seek_var.set(target)
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+
+        if self.is_paused:
+            self.update_frame(force=True)
+            # 暂停态听不到声音，只要把目标位置登记下来，恢复播放时再重建对齐
+            self._request_audio_restart(target / fps)
+        else:
+            self._rebase_master_clock()
+            # 这条路径可能是"焦点在进度条上按 ←/→"来的：ttk.Scale 的类绑定会先
+            # 跑 on_scale_move → _suspend_audio_for_seek()（把声音 set_pause 压住），
+            # 而我们上面刚把它的防抖定时器取消了 —— finish_seek 不会再来，
+            # 挂起就没人负责解除。所以这里自己把音频放回来（很便宜，不重建）。
+            self._resume_audio_after_seek_suspend()
+
+    def nudge_position(self, delta_sec):
+        """快退/快进若干秒（J/L），走既有的跳转路径。
+
+        直接用 `finish_seek`：夹取范围、暂停态重绘、音频对齐、落点记录
+        全都有现成实现，不另起一套（另写一份迟早会和那边不一致）。
+        """
+        if self.cap is None or self.total_frames <= 1:
+            return
+        fps = self.video_fps if self.video_fps > 0 else 25.0
+        target = self._clamp_seek_frame(self.seek_var.get() + delta_sec * fps)
+        self._last_jump_frame = None        # 允许 finish_seek 真的跳这一下
+        self.seek_var.set(target)
+        self.finish_seek()
+
+    def step_volume(self, delta):
+        """↑/↓ 调音量。走 change_volume，保证滑块、静音标记、音量下发三件事一致。"""
+        new_value = max(0.0, min(1.0, self.audio_volume + delta))
+        if abs(new_value - self.audio_volume) < 1e-9:
+            return
+        self.volume_var.set(new_value)      # 让滑块跟着动
+        self.change_volume(new_value)
+
+    def show_shortcuts(self, event=None):
+        """列出所有快捷键（底栏的"快捷键"按钮 / F1）"""
+        messagebox.showinfo(
+            "键盘快捷键",
+            "空格 / K      播放、暂停\n"
+            "←  /  →       上一帧、下一帧（暂停后按可以精确逐帧看）\n"
+            "J  /  L       快退、快进 %.0f 秒\n"
+            "↑  /  ↓       音量 +5%%、-5%%\n"
+            "M             静音开关\n"
+            "F  /  F11     全屏开关\n"
+            "F1            显示这份说明\n\n"
+            "万一按键没反应：点一下画面即可。\n"
+            "（焦点停在按钮/滑块/下拉框上时，那几个键在该控件上有自己\n"
+            "　的用途，会先让给它用 —— 点画面就把焦点收回来。）"
+            % SHORTCUT_SEEK_STEP_SEC,
+        )
 
     # ============================================================
     # 【关键修复】全屏切换改用 grid_remove / grid，避免混用 pack
@@ -1418,6 +1978,19 @@ class VideoPlayerApp:
         # （_start_volume_resume_poll），窗口一关就停。
         self._poll_audio_handoff_ready()
 
+        # 【第 11 轮修复】挂起的音频重建请求必须有"一定会被兑现"的保证。
+        # 原来只有"交接交给工作线程 → 取回时补一次"这么一条路径，而"新播放器还
+        # 在等校准"那段（_audio_handoff_old 非空、thread 为空）不在这条路径上，
+        # 请求会被无声丢掉 —— 而音频此刻已被 set_pause 压住，于是**彻底没声音**，
+        # 1.5 秒后还会被误判成无音轨文件（声音与音量滑块一并永久失效）。
+        # 触发条件很普通：短时间连续拖几下进度条。这里每帧兜一次，保证不会漏。
+        if (self._pending_audio_pos is not None
+                and not self.is_paused and not self.is_seeking
+                and not self._scale_pressed
+                and self._audio_handoff_thread is None
+                and self._audio_handoff_old is None):
+            self._do_audio_restart()
+
         # 【本次修复】到点应用"推迟过的音量同步"（见 _apply_volume_now：
         # 还没确认音频真的在跑时不能调 set_volume，会段错误；
         # 确认之后（时钟校准过 / 抢发窗口开着）才下发）
@@ -1632,6 +2205,10 @@ class VideoPlayerApp:
             except Exception:
                 pass
             self.audio_player = None
+        # 【第 11 轮修复】没有播放器了，"为拖动挂起"的豁免随之失效
+        # （没有播放器时 _audio_clock_media_seconds 本来就会提前返回，
+        #   这里清掉是为了不让标记跨文件残留）。
+        self._mark_audio_live()
 
     def _audio_ff_opts(self, start_sec=0.0):
         """构造 ffpyplayer 的 ff_opts（纯读取当前状态，可在线程里调用）。
@@ -1781,6 +2358,9 @@ class VideoPlayerApp:
         #    用请求时的旧位置会略有滞后。
         self.audio_player = self._create_audio_player(
             self.current_video_path, self._last_media_sec or start_sec)
+        # 【第 11 轮修复】音频已经交给一个活着的播放器了：解除"为拖动挂起"的
+        # 死时钟豁免（否则真·无音轨文件会漏判，见 _mark_audio_live）。
+        self._mark_audio_live()
         # 抢发窗口：开着就允许立刻/反复调 set_volume（此时混音器一定有效）。
         # 先立刻下发一次 —— 大多数情况下新播放器的音频通道这一刻就已经挂上了，
         # 这一发就落到位（音量在它出声之前生效）；再挂 10ms 重试定时器兜底，
@@ -1809,8 +2389,9 @@ class VideoPlayerApp:
         所以这一步之后要立刻关掉抢发窗口。
 
         "确认在跑"的判据与音量下发一致：音频时钟被观测到真的在走
-        （_audio_calibrated）；另外两种情况也收尾 —— 确认这个文件没有音轨
-        （audio_failed / 时钟判死），或兜底超时 AUDIO_HANDOFF_KEEPALIVE_MAX
+        （_audio_calibrated）；另外三种情况也收尾 —— 确认这个文件没有音轨
+        （audio_failed / 时钟判死）、**有待兑现的重建请求**（见下），
+        或兜底超时 AUDIO_HANDOFF_KEEPALIVE_MAX
         （比如交接期间用户把视频暂停了，时钟不会走，不能让旧的无限留着）。
         """
         old = self._audio_handoff_old
@@ -1818,6 +2399,10 @@ class VideoPlayerApp:
             return
         ready = (self._audio_calibrated or self.audio_failed
                  or self._audio_clock_dead
+                 # 【第 11 轮修复】有待兑现的重建请求 ⇒ 眼下这个"新播放器"马上
+                 # 就会被替换掉，没必要再等它校准（等下去就是白等满 3 秒才出声）。
+                 # "交接还在等校准、用户又拖了一下"正是这种情况。
+                 or self._pending_audio_pos is not None
                  or time.time() - self._audio_handoff_started
                  > AUDIO_HANDOFF_KEEPALIVE_MAX)
         if not ready:
@@ -1975,12 +2560,52 @@ class VideoPlayerApp:
 
         只是 set_pause（很便宜），不重建。目的是别让用户一边拖一边听到
         严重错位的旧音频；真正的对齐等停手后由 _request_audio_restart 负责。
+
+        【第 11 轮修复】同时标记 `_audio_suspended_for_seek`：被压住期间 pts 是
+        冻的，死时钟检测必须豁免它（详见 _audio_clock_media_seconds）——
+        否则"连续快速拖动"会被误判成无音轨文件，声音永久消失。
         """
+        self._audio_suspended_for_seek = True
         self._cancel_audio_restart_timer()
         self._pending_audio_pos = None
         if self.audio_player is not None:
             try:
                 self.audio_player.set_pause(True)
+            except Exception:
+                pass
+
+    def _mark_audio_live(self):
+        """解除 `_audio_suspended_for_seek`：音频已经交给一个活着的播放器了。
+
+        与 `_suspend_audio_for_seek` 配对。必须覆盖**所有**"音频重新活过来"的
+        出口，否则这个豁免会永久残留、把真正的无音轨文件漏判（那正是第 7 轮
+        "播放变慢"回归的来源）：
+          - `_begin_audio_handoff` 成功建出新播放器；
+          - `_do_audio_restart` 判定"这份音频永远不会再恢复"（无音轨/已判死）；
+          - `_close_audio_player` / `open_video`（换文件、关窗）；
+          - `toggle_play` 恢复播放。
+        """
+        self._audio_suspended_for_seek = False
+
+    def _resume_audio_after_seek_suspend(self):
+        """音频正被"为拖动而挂起"时就地放回来（**不重建**播放器）。
+
+        与 `_suspend_audio_for_seek` 配对。用在"本来像是要拖动、结果走成了逐帧
+        步进"这条路径上（焦点在进度条上按 ←/→，见 `_on_key_shortcut`）：
+        `step_frame` 会取消 seek 的防抖定时器，于是 `finish_seek` 不会来，
+        而解除挂起本来就挂在它身上 —— 不补这一手，声音会一直哑着，
+        且 `_audio_suspended_for_seek` 永久残留（那会让真·无音轨文件漏判，
+        正是第 7 轮"播放变慢"回归的来源）。
+
+        代价只有一次 `set_pause(False)`：差一帧 40ms，远小于能察觉的音画错位，
+        没必要为此付一次 0.5 秒的重建（这就是"逐帧步进不做音频重建"那条纪律）。
+        """
+        if not self._audio_suspended_for_seek:
+            return                          # 绝大多数情况：压根没挂起，零开销
+        self._mark_audio_live()
+        if self.audio_player is not None:
+            try:
+                self.audio_player.set_pause(False)
             except Exception:
                 pass
 
@@ -2073,18 +2698,38 @@ class VideoPlayerApp:
         )
 
     def _do_audio_restart(self):
-        """执行（或合并）一次音频重建请求 —— 现在是**非阻塞**的后台交接"""
+        """执行（或合并）一次音频重建请求 —— 现在是**非阻塞**的后台交接。
+
+        【第 11 轮修复】原实现在"已有交接在跑"时会把 `_pending_audio_pos` 丢掉，
+        只留一句"等它取回时再补一次"—— 但取回路径只在**交接已交给工作线程**
+        （`_audio_handoff_thread` 非空）时才会跑，而"新播放器还在等校准"这段
+        （`_audio_handoff_old` 非空、thread 为空）根本不在那条路径上。
+        后果很严重：这份重建请求既没被执行、也没被记住，而音频此时已经被
+        `_suspend_audio_for_seek` 压住了 —— 新播放器永远停在暂停态，
+        用户听到的是**彻底没声音**，1.5 秒后还会被误判成无音轨文件。
+        （触发条件很普通：短时间连续拖几下进度条。）
+
+        现在改为：把请求**留着**，交给 update_frame 每帧的兜底检查兑现。
+        """
         self._audio_restart_timer = None
         pos = self._pending_audio_pos
         if pos is None:
             return
-        if self._audio_handoff_thread is not None:
-            # 已有交接在跑：留着 _pending_audio_pos，等它取回时再补一次
+        # 没有文件 / 音频已判死：这份请求永远不会被兑现，就地作废，
+        # 免得每帧都重试一遍（也顺手解除拖动挂起标记，让死时钟检测恢复工作）。
+        if not self.current_video_path or self.audio_failed or self._audio_clock_dead:
+            self._pending_audio_pos = None
+            self._mark_audio_live()
+            return
+        if self._audio_handoff_thread is not None or self._audio_handoff_old is not None:
+            # 已有交接在跑：**保留** _pending_audio_pos，别丢。
+            # 交接收尾（_poll_audio_handoff）会用它再补一次；
+            # update_frame 里还有一道每帧兜底，保证它一定会被兑现。
             return
         self._pending_audio_pos = None
         if self._begin_audio_handoff(pos) is False:
-            # 启动失败（没有文件 / 音频已判死）：请求就此作废，不留残留状态
-            self._pending_audio_pos = None
+            # 走到这里说明上面三个前提刚刚变了（理论上不会），留着重试。
+            self._pending_audio_pos = pos
 
     def _flush_pending_audio_restart(self):
         """把挂起的重建兑现（恢复播放时调用）
@@ -2119,7 +2764,14 @@ class VideoPlayerApp:
         p = self.audio_player
         if p is None or self.audio_failed or self._audio_clock_dead:
             return None
-        if self.is_paused or self.is_seeking or self._scale_pressed:
+        if (self.is_paused or self.is_seeking or self._scale_pressed
+                or self._audio_suspended_for_seek):
+            # 【第 11 轮修复】最后一项是新增的：音频"为了拖动被 set_pause 压住、
+            # 还没被交给新播放器"时，pts 同样是冻的。
+            # 原来只判断 is_seeking / _scale_pressed，而那两个标志在**松手后立刻**
+            # 就恢复 False —— 于是"连续快速拖动"里两下之间的空隙，会被当成
+            # "音频在播放却一动不动"，累计 1.5 秒就判死时钟 + audio_failed，
+            # 声音和音量滑块从此永久失效（实测：拖 6 次就必现）。
             return None
         if self._pending_audio_pos is not None or self._audio_restart_timer is not None:
             return None

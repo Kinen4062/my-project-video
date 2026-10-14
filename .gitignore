@@ -15,6 +15,35 @@ dist/
 .idea/
 .vscode/
 
+__pycache__/
+*.pyc
+temp_3d_output.mp4
+*.log
+.env
+screenshot.jpg
+
 # 系统
 .DS_Store
 Thumbs.db
+
+# 测试素材目录
+# ------------------------------------------------------------
+# 这个目录是"放你自己视频的地方"，里面会出现动辄几十 MB 的转换产物
+# （左右分屏 3D 视频）。一旦入库，每次改动都会在历史里永久留一份，仓库体积
+# 会迅速失控（GitHub 单文件硬上限 100MB）。
+# 只保留回归测试要用的那一个夹具；其余一律不入库。
+# 注意：这里必须写成 `test_videos/*` 再取反，不能写 `test_videos/` ——
+# 后者会把整个目录排除掉，而对被排除目录内部的取反是不生效的。
+test_videos/*
+!test_videos/city.mp4
+
+# 回归测试的运行期素材（无声的假 3D 产物等）都是现场生成的，见 tests/_harness.py
+
+# 备份文件：有了版本控制就不需要手写 .bak 了
+*.bak
+*.orig
+
+# 程序运行期产物
+screenshot*.jpg
+screenshot*.png
+depth_output.jpg
