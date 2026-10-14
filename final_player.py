@@ -32,11 +32,17 @@ from ffpyplayer.player import MediaPlayer
 #   playlist_store —— 播放列表的落盘（一个小 JSON，读写失败静默降级）
 #   filedrop       —— 从资源管理器拖文件进来（纯 ctypes，无需第三方库）
 # 它们都跟着仓库一起走，不装任何新依赖。
+#
+# 【第 17 轮·记忆播放位置】再来一个，与 playlist_store 是一对：
+#   resume_store —— "上次看到哪儿"的落盘（同样是配置目录下的小 JSON）
+# 注意它的**姊妹关系**：两者都只管"数据怎么存"，"什么时候存"由本文件决定
+# （见 _settle_current_position）。这里再没有别的账要算。
 # ============================================================
 import media_tools
 import depth3d
 import viewfit
 import playlist_store
+import resume_store
 import filedrop
 # 下面这个名字只是**再导出**：实现已经不在本文件里了，
 # 但测试套件引用 `final_player.has_audio_stream`，所以要留着。
@@ -286,6 +292,29 @@ MOTION_THROTTLE_MS = 100
 CONVERSION_JOIN_TIMEOUT_SEC = 1.0
 
 # ============================================================
+# 【第 17 轮·新】记忆播放位置
+# ------------------------------------------------------------
+# 需求：播放器关掉、或者切去别的视频之后再点回这个没看完的片子时，
+# 让用户选"从头播"还是"接着看"。
+#
+# 整个功能只需回答一个问题：**这一次离开，算不算"没看完"？**
+# 下面两条阈值就是全部判据，一句话能讲清：
+#
+#   停在 RESUME_MIN_POSITION_SEC 秒以内 → 当作"还没开始看"，不值得记也不值得问
+#   距末尾 RESUME_TAIL_SEC 秒以内      → 当作"看完了"，顺手把记录清掉
+#   中间那一大段                        → 记下来，下次问一句
+#
+# 两个值取得一样（5 秒）纯属省得记两套数：偏头的 5 秒和偏尾的 5 秒，在
+# 观感上都是"基本没看"和"基本看完了"。改大了不会出错，只会让询问变多
+# （用户被问烦了自然会点"从头"），所以宁可保守。
+#
+# ⚠️ 判"看完"只用"距末尾多少秒"，**不用比例**。曾经想过"过了 95% 也算完"，
+#    但 2 小时的片子剩 6 分钟（95%）明明还想接着看，按比例判就会把记录清掉。
+#    按绝对秒数判，长片短片一视同仁。
+RESUME_MIN_POSITION_SEC = 5.0
+RESUME_TAIL_SEC = 5.0
+
+# ============================================================
 # 【第 11 轮·新】转换产物补回音轨
 # ------------------------------------------------------------
 # 背景：`process_video_to_3d` 用 `cv2.VideoWriter` 写 3D 产物，而它**只写视频流**
@@ -353,6 +382,24 @@ def find_ffmpeg():
     return None
 
 
+def format_hms(seconds):
+    """秒 → `"12:34"` / `"1:02:34"`（负数、非数字一律按 0 处理）。
+
+    【第 17 轮·新】"记忆播放位置"要给用户看时间（"上次看到 12:34 / 45:00"），
+    而进度条那边只在**窗口标题**里显示"秒"，没有格式化函数可用。写成模块级
+    纯函数是为了能在测试里单独量它（边界：0 / 59 / 60 / 3599 / 3600 / 负数）。
+    """
+    try:
+        total = int(max(0.0, float(seconds)))
+    except (TypeError, ValueError):
+        total = 0
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return "%d:%02d:%02d" % (hours, minutes, secs)
+    return "%d:%02d" % (minutes, secs)
+
+
 # `has_audio_stream()` 与 `_remove_quietly()` 的实现已搬到 media_tools.py。
 # 前者仍在本模块出现 —— 那是**再导出**（见文件顶部的 import），测试套件要用。
 
@@ -374,8 +421,108 @@ class PlayState:
     PAUSED = "paused"
 
 
+class ResumeDialog:
+    """【第 17 轮·新】"这个片子要接着看吗"的模态对话框。
+
+    ## 为什么不用 messagebox
+
+    三选一（继续 / 从头 / 取消）在 `messagebox.askyesnocancel` 里只能映射成
+    "是 / 否 / 取消"，按钮文字跟含义对不上 —— 用户得先读懂问题、再去猜哪个
+    按钮是"从头"。自建一个 Toplevel，三个按钮直接把动作写在脸上。
+
+    ## 为什么"建"与"等"要拆开
+
+    `__init__` 只把窗口搭出来，`show()` 才 `grab_set` + `wait_window`。
+    这样测试可以**只建不等**：直接 `_pick("resume")` 就能验证三个返回值，
+    不必去点真实窗口 —— 模态等待会把无人值守的回归整轮挂死。
+
+    ## 三条退出路径都算数
+
+    回车 = 继续（默认动作）、Esc = 取消、点标题栏的 × = 取消。
+    一个都不能漏：漏了 × 的那次，`wait_window` 返回后 `choice` 是 None，
+    照旧按"取消"处理 —— 所以这里即使不绑 `WM_DELETE_WINDOW`，行为也正确。
+    绑它是为了让三条路径都**显式**在代码里看得见。
+    """
+
+    def __init__(self, master, file_path, sec, dur):
+        self.choice = None
+        self.top = tk.Toplevel(master)
+        self.top.title("继续播放？")
+        self.top.configure(bg=DARK_BG)
+        self.top.resizable(False, False)
+        try:
+            self.top.transient(master)
+        except tk.TclError:
+            pass
+
+        wrap = tk.Frame(self.top, bg=DARK_BG, padx=18, pady=14)
+        wrap.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(wrap, text="这个视频上次没有看完", bg=DARK_BG, fg=DARK_FG,
+                 font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w")
+        tk.Label(wrap, text=os.path.basename(file_path) or file_path,
+                 bg=DARK_BG, fg=DARK_ACCENT, font=("Microsoft YaHei UI", 10),
+                 wraplength=400, justify="left").pack(anchor="w", pady=(4, 8))
+        tk.Label(wrap,
+                 text="上次看到 %s / %s，还剩 %s\n要接着看，还是从头开始？"
+                      % (format_hms(sec), format_hms(dur),
+                         format_hms(max(0.0, dur - sec))),
+                 bg=DARK_BG, fg=DARK_FG2, justify="left",
+                 font=("Microsoft YaHei UI", 10)).pack(anchor="w")
+
+        row = tk.Frame(wrap, bg=DARK_BG)
+        row.pack(fill=tk.X, pady=(14, 0))
+        # 默认（回车）是"继续播放"：这是用户点回来时更可能想要的那个。
+        self.btn_resume = tk.Button(row, text="继续播放",
+                                    command=lambda: self._pick("resume"),
+                                    **BTN_PRIMARY)
+        self.btn_restart = tk.Button(row, text="从头播放",
+                                     command=lambda: self._pick("restart"),
+                                     **BTN_NORMAL)
+        self.btn_cancel = tk.Button(row, text="取消",
+                                    command=lambda: self._pick(None),
+                                    **BTN_NORMAL)
+        self.btn_resume.pack(side=tk.LEFT)
+        self.btn_restart.pack(side=tk.LEFT, padx=8)
+        self.btn_cancel.pack(side=tk.RIGHT)
+
+        self.top.bind("<Return>", lambda e: self._pick("resume"))
+        self.top.bind("<Escape>", lambda e: self._pick(None))
+        self.top.protocol("WM_DELETE_WINDOW", lambda: self._pick(None))
+        self.btn_resume.focus_set()
+        self.top.update_idletasks()
+        self._center_on(master)
+
+    def _center_on(self, master):
+        """摆在主窗口偏上一点的位置 —— 正中间会压住画面正中的主体。"""
+        try:
+            w, h = self.top.winfo_reqwidth(), self.top.winfo_reqheight()
+            x = master.winfo_rootx() + max(0, (master.winfo_width() - w) // 2)
+            y = master.winfo_rooty() + max(0, (master.winfo_height() - h) // 3)
+            self.top.geometry("+%d+%d" % (x, y))
+        except Exception:
+            pass
+
+    def _pick(self, choice):
+        """记下选择并关掉窗口（`show()` 的 `wait_window` 随之返回）。"""
+        self.choice = choice
+        try:
+            self.top.destroy()
+        except Exception:
+            pass
+
+    def show(self):
+        """等用户点完；返回 `"resume"` / `"restart"` / `None`（取消）。"""
+        try:
+            self.top.grab_set()
+            self.top.wait_window()
+        except Exception:
+            pass
+        return self.choice
+
+
 class VideoPlayerApp:
-    def __init__(self, root, playlist_path=None):
+    def __init__(self, root, playlist_path=None, resume_path=None):
         """搭建整个应用。
 
         【第 12 轮·重构】这个方法原来是 391 行、一口气干七件事，没人能一口气
@@ -394,6 +541,9 @@ class VideoPlayerApp:
         `playlist_path` 是播放列表 JSON 的位置；默认走 `playlist_store` 的用户
         配置目录。测试会传一个临时文件进来 —— 否则跑一次回归就会把用户真实的
         播放列表覆盖掉，而"列表里有东西"本身又会干扰用例（见 tests/_harness.py）。
+
+        【第 17 轮】`resume_path` 是"记忆播放位置"那份 JSON 的位置，同样由测试
+        传临时文件进来（理由逐字同上：不能把用户真实的观看进度覆盖掉）。
         """
         self.root = root
         self.setup_dark_theme()
@@ -404,6 +554,7 @@ class VideoPlayerApp:
 
         self._init_playback_state()
         self._init_playlist_state(playlist_path)
+        self._init_resume_state(resume_path)
         self._build_video_area()
         self._build_progress_bar()
         self._build_control_bars()
@@ -502,6 +653,32 @@ class VideoPlayerApp:
         self.autoplay_next = True
         self._dnd_enabled = False
         self._playlist_visible = True
+
+    def _init_resume_state(self, resume_path=None):
+        """【第 17 轮·新】"记忆播放位置"的**纯状态**（不建控件、不碰播放）。
+
+        与 `_init_playlist_state` 是一对：同样是"用户配置目录下的小 JSON"，
+        同样必须在建控件之前跑完吗 —— 其实这里**没这个要求**（没有任何控件
+        读它），但紧挨着放，两口子的事一眼能对上。
+
+        四个字段，各自存在的理由：
+          · `_resume_positions` —— 内存里的记录表 `{键: 记录}`，唯一事实来源。
+            查询/写入都走它，写盘只是把它序列化出去（见 _save_resume）。
+          · `resume_enabled`    —— **总开关**。关掉后既不记也不读，等于退回
+            第 16 轮的行为。测试基架默认关掉它（见 tests/_harness.load_app）：
+            老套件会反复打开同一个文件，记录一开，第二次打开就会"静默续播"
+            到上次停的位置 —— 那些用例量的东西就悄悄变了样子。
+            更要紧的是：不隔离的话，跑一次回归就往用户**真实的**观看进度里
+            写东西（配置文件路径同样在 _harness 里被换掉，双保险）。
+          · `_resume_ignored`   —— 不该进这套体系的文件。目前只有一种：
+            `open_video(record=False)` 打开的转换临时产物（躺在 %TEMP% 里，
+            下次转换就没），记下来只会留下点不回去的死条目。
+          · `_resume_path`      —— 这份 JSON 在哪儿（测试会换成临时文件）。
+        """
+        self._resume_path = resume_path or resume_store.default_path()
+        self._resume_positions = resume_store.load(self._resume_path)
+        self.resume_enabled = True
+        self._resume_ignored = set()
 
     def _build_video_area(self):
         """顶层 grid 布局 + 视频显示区（video_container / video_label）。
@@ -1314,7 +1491,141 @@ class VideoPlayerApp:
         """
         return self._bg.get(frame, win_w, win_h)
 
-    def open_video(self, file_path=None, record=True):
+    # ============================================================
+    # 【第 17 轮·新】记忆播放位置
+    # ------------------------------------------------------------
+    # 需求：播放器关掉、或者切去别的视频之后，再点回这个没看完的片子时，
+    # 让用户选"从头播"还是"接着看"。
+    #
+    # 三件事，各管一段：
+    #   ① 离开一个视频时记下它停在哪儿 —— `_settle_current_position()`
+    #      （两个调用点：open_video 开头换文件时、on_close 关窗时；另有
+    #        update_frame 撞到片尾那一次，那是"看完了"，记录要清掉）
+    #   ② 再次打开时查记录、问一句 —— `_lookup_resume()` + open_video 开头那段
+    #   ③ 记录落盘，关掉播放器也还在 —— `resume_store`（独立模块）
+    #
+    # 两个决定值得先写下来：
+    #
+    # · **路径是键，但记录里要带文件指纹。** 同一个路径指向的可能是不同的东西
+    #   （重新转换一次就把它覆盖了），指纹对不上就当没有这条记录
+    #   （见 _lookup_resume 里那两类"失效"）。
+    #
+    # · **"记"只在离开时发生，播放过程中一次都不写盘。** 播放时每秒去更新一次
+    #   磁盘文件既没必要、又会在长片里反复写；而"停在哪儿"这件事只在离开那一
+    #   刻才成为事实上的最终答案。于是写盘的频率是"用户切一次视频"，可以忽略。
+    # ============================================================
+    def _settle_current_position(self, finished=False):
+        """离开当前视频时结算它的位置：记下来，或者把记录清掉。
+
+        `finished=True` 表示"这一遍播到头了"（`update_frame` 里 `cap.read()`
+        已经读不出帧）—— 那时位置不可信（cap 停在末尾，也可能停在某个解码
+        出错的地方），所以不去量它，**直接当看完**、把记录清掉。
+
+        它**不碰任何播放状态**：只读 `current_video_path` 和 cap 的位置，然后写
+        自己的记录表。正因如此，放在 open_video 最开头（用户接下来还可能点
+        "取消"）也是安全的 —— 就算取消了，顺手记一下位置也毫无副作用。
+        """
+        if not self.resume_enabled:
+            return
+        path = self.current_video_path
+        if not path or not os.path.isfile(path):
+            return
+        if resume_store.make_key(path) in self._resume_ignored:
+            return
+        if finished:
+            self._forget_resume(path)
+            return
+
+        dur = self._position_duration_sec()
+        if dur <= 0:
+            return                          # 拿不到时长就无从判断"看完没有"
+        sec = self._current_video_seconds()
+        if sec >= dur - RESUME_TAIL_SEC:
+            self._forget_resume(path)       # 已经贴着片尾，按看完处理
+            return
+        if sec < RESUME_MIN_POSITION_SEC:
+            return                          # 太靠前，等于从头，不值得打扰用户
+        self._remember_resume(path, sec, dur)
+
+    def _position_duration_sec(self):
+        """当前视频的总时长（秒）；拿不到返回 0。"""
+        if self.total_frames <= 0:
+            return 0.0
+        fps = self.video_fps if self.video_fps > 0 else 30.0
+        return self.total_frames / fps
+
+    def _remember_resume(self, path, sec, dur):
+        """写一条位置记录：先改内存，再立刻落盘。
+
+        立刻落盘而不是"攒到关窗再写"：关播放器的方式不止一种（正常关、任务
+        管理器结束、掉电），"切走这个视频"是最近一次能保证写得下去的机会。
+        代价也很小 —— 几 KB 的 JSON，频率是"用户切一次视频"。
+        """
+        entry = {"path": path, "sec": float(sec), "dur": float(dur),
+                 "at": time.time()}
+        try:
+            st = os.stat(path)
+            entry["size"] = float(st.st_size)
+            entry["mtime"] = float(st.st_mtime)
+        except OSError:
+            pass            # 拿不到指纹就不带，查询时那段校验自然跳过
+        self._resume_positions[resume_store.make_key(path)] = entry
+        self._save_resume()
+
+    def _forget_resume(self, path):
+        """删掉这个文件的记录（本来就没有的话不写盘）。"""
+        if self._resume_positions.pop(resume_store.make_key(path), None) is not None:
+            self._save_resume()
+
+    def _save_resume(self):
+        return resume_store.save(self._resume_positions, self._resume_path)
+
+    def _lookup_resume(self, path):
+        """这个文件上次停在哪儿？返回记录，没有（或已失效）返回 None。
+
+        两类"失效"会被**就地清掉**，免得下次还拿它来问：
+
+        · 文件指纹对不上（大小 / 修改时间变了）—— 同一路径已经是另一个文件了，
+          上次的位置毫无意义。这一条挡住的是很实在的坑：重新转换覆盖了同名
+          文件之后，拿旧位置去播新文件，一开局就冲到中段。
+        · 位置本身越界 —— 记录是别处写来的（换了机器、手改过 JSON），
+          或者片尾那一段边界情况。
+        """
+        if not self.resume_enabled:
+            return None
+        key = resume_store.make_key(path)
+        if key in self._resume_ignored:
+            return None
+        entry = self._resume_positions.get(key)
+        if entry is None:
+            return None
+        try:
+            st = os.stat(path)
+        except OSError:
+            self._forget_resume(path)
+            return None
+        if entry.get("size") is not None:
+            same = (entry["size"] == st.st_size
+                    and abs(entry.get("mtime", 0.0) - st.st_mtime) <= 1e-6)
+            if not same:
+                self._forget_resume(path)
+                return None
+        sec, dur = entry["sec"], entry["dur"]
+        if sec < RESUME_MIN_POSITION_SEC or sec >= dur - RESUME_TAIL_SEC:
+            self._forget_resume(path)
+            return None
+        return entry
+
+    def _ask_resume_choice(self, file_path, sec, dur):
+        """问用户"接着看还是从头"；返回 `"resume"` / `"restart"` / `None`（取消）。
+
+        单独抽成一个方法是为了**可替换**：测试把它换成一个固定返回值的函数，
+        就能走遍三条分支，不必去点真实对话框 —— 模态等待会把无人值守的回归
+        整轮挂死（见 ResumeDialog 的说明）。
+        """
+        return ResumeDialog(self.root, file_path, sec, dur).show()
+
+    def open_video(self, file_path=None, record=True, resume=True, ask=True):
         """打开（并开始播放）一个视频文件。
 
         `record=True` 时会把这个文件记进右侧播放列表 —— 这是需求里"将要播放的
@@ -1322,13 +1633,49 @@ class VideoPlayerApp:
         （`on_conversion_done` 传 record=False）：它躺在 %TEMP% 里，下次转换就
         会被删掉，记进列表只会留下永远点不开的死条目。
 
-        返回 True = 已经开始播放这个文件；False = 用户取消了对话框，或者文件
-        打不开。片尾自动续播靠这个返回值判断"要不要把这一项标记成播不动"。
+        【第 17 轮·新】`resume` / `ask` 两个参数管"记忆播放位置"：
+
+          · `resume=True`（默认）—— 这个文件上次没看完的话，按记录决定从哪儿起播。
+          · `resume=False`      —— 完全不理历史记录，一律从头播。转换产物走这条。
+          · `ask=True`（默认）  —— 有记录时弹窗问"继续 / 从头"。
+          · `ask=False`         —— 有记录就**静默**接着上次的位置播，不问。
+                                   片尾自动连播走这条：那是"往下连播"，中途
+                                   弹窗会把连播打断，而那个文件上次没看完、
+                                   这次接着看，本来就是连播该有的样子。
+
+        返回 True = 已经开始播放这个文件；False = 用户取消了（关掉文件对话框，
+        或者点了续播询问框的"取消"），或者文件打不开。片尾自动续播靠这个返回值
+        判断"要不要把这一项标记成播不动"。
         """
         if file_path is None:
             file_path = filedialog.askopenfilename(filetypes=self._video_filetypes())
             if not file_path:
                 return False
+
+        # 【第 17 轮·新】① 把"上一个视频停在哪儿"记下来。
+        # ⚠️ 必须在换掉 cap **之前**做 —— 位置只能从还活着的那一个读出来。
+        self._settle_current_position()
+
+        # 【第 17 轮·新】② 查这个文件有没有"上次没看完"的记录，有就问一句。
+        #
+        # ⚠️ **必须在 _stop_playback_loop() 之前**。用户可能点"取消"，那时当前
+        #    正在播的东西必须原封不动 —— 所以这一段只做"查表 + 弹窗"，一个播放
+        #    状态都不碰，取消时直接 return False 走人。放后面的话，"取消"会变成
+        #    "当前视频已经停了，新视频又没开"。
+        start_sec = 0.0
+        if resume and self.resume_enabled:
+            entry = self._lookup_resume(file_path)
+            if entry is not None:
+                sec, dur = entry["sec"], entry["dur"]
+                choice = self._ask_resume_choice(file_path, sec, dur) if ask else "resume"
+                if choice == "restart":
+                    # 用户明确要从头看：把记录清掉。不清的话下次又问、又续 ——
+                    # 而"从头播放"这句话的意思正是"那条记录我不要了"。
+                    self._forget_resume(file_path)
+                elif choice == "resume":
+                    start_sec = sec
+                else:
+                    return False            # 取消：当前播放原样不动
 
         # 停止旧视频的播放循环，防止定时器叠加导致加速
         # 【P2 修复】原来这里是手写两行（is_playing=False + 取消定时器），
@@ -1342,6 +1689,27 @@ class VideoPlayerApp:
         if not self.cap.isOpened():
             messagebox.showerror("错误", "无法打开视频文件")
             return False
+
+        # 【第 17 轮·新】record=False 的文件（转换临时产物）不进"记忆位置"体系。
+        # 放在"确实能打开"之后：打不开的文件没必要往这个集合里塞。
+        if record:
+            self._resume_ignored.discard(resume_store.make_key(file_path))
+        else:
+            self._resume_ignored.add(resume_store.make_key(file_path))
+
+        # 【第 17 轮·新】帧率/总帧数**提前到这里读** —— 原来在"音频播放器建好
+        # 之后"，现在要用它把续播起点从"秒"换算成"帧"，必须先用上。
+        fps = self.cap.get(cv2.CAP_PROP_FPS)
+        self.video_fps = fps if fps > 0 else 30.0
+        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.scale.config(to=self.total_frames)
+
+        # 把续播起点落到 cap 上。放在这里而不是等 update_frame 之后：后面建音频
+        # 播放器、发第一帧都要用同一个位置，先定位再起播，一次到位，不会出现
+        # "画面还在第 0 帧、音频已经跳到第 12 秒"的错位。
+        start_frame = self._clamp_seek_frame(int(start_sec * self.video_fps))
+        if start_frame > 0:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
         # 【第 16 轮·新】先探测这个文件有没有音轨（结论在上面 _create_audio_player
         # 那里用得上：没有音轨就根本不建播放器）。
@@ -1380,7 +1748,10 @@ class VideoPlayerApp:
         self._last_jump_frame = None
         self._scale_pressed = False
         self._silent_clock_base = None      # 换了文件，墙钟主时钟重新对表
-        self._last_media_sec = 0.0          # 音频交接用的"当前视频位置"也归零
+        # 音频交接用的"当前视频位置"。【第 17 轮】从续播点起算而不是 0 ——
+        # 交接建新播放器时取的就是它（见 _last_media_sec 的说明），
+        # 从 0 起算会让"续播后又跳转一次"的音频落到片头。
+        self._last_media_sec = start_sec
         self.audio_failed = False  # 换文件后允许重试一次音频
         # 【第 16 轮·新】把上面探测的结论落地（为什么必须连 audio_failed 一起置，
         # 见 _probe_audio_track 的说明；探测不了 = None 时**不置**，
@@ -1392,21 +1763,20 @@ class VideoPlayerApp:
         self._mark_audio_live()
         self.btn_play.config(text="暂停")
 
-        # 创建新的音频播放器（与视频同一文件，从 0 秒开始）
+        # 创建新的音频播放器（与视频同一文件）。
+        # 【第 17 轮】起点从 0 改成 start_sec —— 视频在 cap.set 上定位了，
+        # 音频必须落到同一个位置，否则续播一开头就是音画错位。
         # ⚠️ 必须赶在**旧实例还活着**的时候建（上面只是摘下、并没有关）——
         # "先建后关"是硬约束：旧实例还占着一条混音通道，SDL 混音器才不会被销毁，
         # 随后对新播放器调 set_volume 才安全（见 _apply_volume_now 的实测）。
-        self.audio_player = self._create_audio_player(file_path, 0.0)
+        self.audio_player = self._create_audio_player(file_path, start_sec)
         # 【第 15 轮·修复】新的已就位，现在才把旧的交出去 —— 它会被留到
         # "新播放器的音频确认在跑"之后，再由后台线程关掉（见 _retire_audio_player）。
         self._retire_audio_player(old_audio)
 
-        fps = self.cap.get(cv2.CAP_PROP_FPS)
-        self.video_fps = fps if fps > 0 else 30.0
-
-        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.scale.config(to=self.total_frames)
-        self.seek_var.set(0)
+        # 【第 17 轮】进度条也直接落到续播点（原来无条件写 0），免得第一帧
+        # 渲染之前滑块还指着片头。
+        self.seek_var.set(start_frame)
 
         self.update_frame()
 
@@ -1415,6 +1785,13 @@ class VideoPlayerApp:
         if record:
             self._playlist_add([file_path])
             self._refresh_playlist_ui(select_path=file_path)
+
+        # 【第 17 轮·新】续播时明确告诉用户"刚才那个选择生效了，从这儿开始"。
+        # 不吭声的话，画面直接跳到中间会让人怀疑是播放器坏了。
+        if start_sec > 0:
+            self._set_playlist_status("从 %s 继续播放：%s"
+                                      % (format_hms(start_sec),
+                                         os.path.basename(file_path) or file_path))
 
         # 【第 11 轮·修正 2】刚选完文件的用户，下一个动作几乎一定是播放/暂停。
         # 而此刻焦点还留在"打开视频"那个按钮上 —— 空格会被按钮吃掉（重新打开
@@ -1678,7 +2055,9 @@ class VideoPlayerApp:
             except Exception:
                 pass
 
-        self.open_video(output_path, record=False)
+        # 【第 17 轮】resume=False：临时产物没有"上次看到哪儿"可言
+        # （每转一次都是一个新路径），显式说清楚比"碰巧没有记录"可靠。
+        self.open_video(output_path, record=False, resume=False)
 
         # 【P2 修复】原来这里无条件把模式切成"红蓝3D"，提示语也直接假设
         # 用户有红蓝眼镜 —— 没有眼镜的人会看到一张奇怪的叠影图，还以为
@@ -2502,6 +2881,14 @@ class VideoPlayerApp:
         start_time = time.time()
         ret, frame = self.cap.read()
         if not ret:
+            # 【第 17 轮·新】"这一遍播到头了" —— 顺手把"记忆播放位置"清掉。
+            # 下次再点开这个文件就是从头播、不再问"要不要继续"：片子都看完了，
+            # 再问一句"上次看到 19:58，要接着看吗"只会让人莫名其妙。
+            # 之所以是显式告诉它"finished"，而不是让它自己去量位置：此刻
+            # `cap.read()` 已经读不出帧，位置读数不可信（停住不动、或者停在
+            # 某个解码出错的地方）。
+            self._settle_current_position(finished=True)
+
             # 【第 14 轮·新】先问播放列表：还有下一项就切过去，而不是在原地绕圈。
             #   ⚠️ 必须**立刻 return** —— open_video 内部已经停掉旧的播放循环、
             #   重新排好了下一帧；这里再往下走就会再排一次，两套定时器叠加
@@ -2510,7 +2897,10 @@ class VideoPlayerApp:
             #   只是用户改了视差/切了模式要刷新一张画面，不能顺手把文件换掉。
             next_path = self._advance_playlist() if not force else None
             if next_path is not None:
-                if not self.open_video(next_path):
+                # 【第 17 轮】ask=False：这是"往下连播"，不该在中途弹窗打断。
+                # 但如果那个文件上次也没看完，就静默接着上次的位置 —— 连播
+                # 本来就是这个意思（像追剧，一集接一集）。
+                if not self.open_video(next_path, ask=False):
                     # 文件在、但解不开（编码坏了等）：记下来，下一轮续播会跳过它，
                     # 本帧到此为止 —— 不要再往下走和 3D 处理抢状态。
                     self._playlist_failed.add(next_path)
@@ -2584,6 +2974,12 @@ class VideoPlayerApp:
 
     def on_close(self):
         """关闭窗口时彻底释放所有资源，确保进程真正退出"""
+        # 0. 【第 17 轮·新】把"这个视频停在哪儿"存下来。
+        #    必须是**第一件事** —— 下面第 5 步会 release 掉 cap，位置只能从
+        #    还活着的那个读；而且第 2 步之后 play_state 就成 IDLE 了。
+        #    （用户关了播放器、过几天再打开，能接着上次看，靠的就是这一句。）
+        self._settle_current_position()
+
         # 1. 通知转换线程退出（不等待，它是 daemon 线程）
         if self.is_converting:
             self.conversion_cancel_event.set()

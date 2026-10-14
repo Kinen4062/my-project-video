@@ -411,7 +411,23 @@ def make_playlist_path():
     return path
 
 
-def load_app(geometry="1000x700", autoplay_next=False):
+def make_resume_path():
+    """【第 17 轮】"记忆播放位置"那份 JSON 的隔离路径，理由逐字同上。
+
+    它比播放列表还更要紧一点：播放列表被写坏，用户重启后看见的是"列表少了几
+    条"；观看进度被写坏，用户会莫名其妙地从片子中间开始播 —— 而"为什么从这
+    里开始"是件很难自己想明白的事。所以两处都不能碰用户真实的配置。
+    """
+    path = os.path.join(work_dir("_resume"),
+                        "positions_%d_%d.json" % (os.getpid(), next(_app_counter)))
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return path
+
+
+def load_app(geometry="1000x700", autoplay_next=False, resume_enabled=False):
     """装载一个 app。
 
     `autoplay_next=False`（默认）会关掉**片尾自动续播** —— 老套件量的是
@@ -419,6 +435,14 @@ def load_app(geometry="1000x700", autoplay_next=False):
     而它们跑的过程中会打开好几个视频、播放列表因此会攒下半打条目；
     续播一开，片尾就从"回绕同一个文件"变成"切到列表里的下一个"，
     那些用例量的东西就悄悄变了样子。播放列表自己的套件显式传 True。
+
+    `resume_enabled=False`（默认）会关掉【第 17 轮】的"记忆播放位置"。
+    理由与上一条同源，但更硬：老套件会**反复打开同一个文件**
+    （`test_chaos` 一轮就开几十次），记录一开，第二次打开就变成"静默续播到
+    上次停的位置" —— 位置不再是 0，那些量"片尾回绕""测速""逐帧步进"的用例
+    全部失去意义。加上 `resume_path` 也换成了临时文件（见 make_resume_path），
+    用户的真实观看进度同样不会被写。
+    续播自己的套件（tests/test_resume.py）显式传 True。
     """
     if PROJ not in sys.path:
         sys.path.insert(0, PROJ)
@@ -427,8 +451,10 @@ def load_app(geometry="1000x700", autoplay_next=False):
     root = tk.Tk()
     root.geometry(geometry)
     root.update()
-    app = fp.VideoPlayerApp(root, playlist_path=make_playlist_path())
+    app = fp.VideoPlayerApp(root, playlist_path=make_playlist_path(),
+                            resume_path=make_resume_path())
     app.autoplay_next = autoplay_next
+    app.resume_enabled = resume_enabled
     # 【第 16 轮】关掉"启动后预热列表文件音轨结论"的后台线程（见
     # final_player._warm_audio_probe_cache）。它要起 ffmpeg 子进程，会跟
     # test_playlist.py ⑪ 节那条"连续切换 <150ms"的断言抢磁盘和 CPU，让耗时
@@ -441,7 +467,33 @@ def load_app(geometry="1000x700", autoplay_next=False):
 
 
 def teardown(root, app):
-    """收尾。**绝不调用 `app.on_close()`**（它会 os._exit(0) 掐掉测试进程）。"""
+    """收尾。**绝不调用 `app.on_close()`**（它会 os._exit(0) 掐掉测试进程）。
+
+    【第 17 轮】多一步：**先把挂起的 after 定时器全部取消，再拆窗口**。
+
+    少了这一步会打出一行看着很吓人的噪音：
+
+        invalid command name "1234567890_finish_resize"
+
+    来龙去脉：`after` 会在 Tcl 里注册一个命令名；`window.destroy()` 会把该窗口
+    注册过的命令全删掉，但**定时器本身还留在 Tcl 的事件队列里**。于是之后任何
+    一次事件泵跑到它，Tcl 找不到那个命令就报这么一句。它不影响任何断言，但会
+    让日志看起来像坏了（本轮 test_resume ⑧ 节"同进程再开一个 app"就是这样踩到
+    的：新窗口读回记录后立刻被拆掉，它挂起的 resize 防抖回调留在了队列里）。
+
+    `on_close()` 本来就有这一步（它排第 3 步），`teardown` 之前一直漏了 ——
+    只因为老套件"拆窗口之后就不再泵事件了"才没暴露。
+    """
+    for attr in ("after_id", "resize_after_id", "seek_timer", "_hide_controls_id",
+                 "_audio_restart_timer", "_audio_handoff_poll_id",
+                 "_audio_volume_resume_timer"):
+        tid = getattr(app, attr, None)
+        if tid is not None:
+            try:
+                root.after_cancel(tid)
+            except Exception:
+                pass
+            setattr(app, attr, None)
     for fn in (getattr(app, "_stop_playback_loop", None),
                lambda: app._cancel_audio_handoff(timeout=1.0),
                getattr(app, "_close_audio_player", None)):
@@ -461,13 +513,15 @@ def teardown(root, app):
         pass
 
 
-def run_suite(title, body, autoplay_next=False):
+def run_suite(title, body, autoplay_next=False, resume_enabled=False):
     """套件统一入口：装载 → 跑 body(root, app, fp, summary) → 收尾 → 返回退出码
 
     `autoplay_next` 见 `load_app` 的说明（默认关，播放列表套件传 True）。
+    `resume_enabled` 同（默认关，test_resume.py 传 True）。
     """
     summary = Summary(title)
-    root, app, fp = load_app(autoplay_next=autoplay_next)
+    root, app, fp = load_app(autoplay_next=autoplay_next,
+                             resume_enabled=resume_enabled)
     try:
         body(root, app, fp, summary)
     finally:
