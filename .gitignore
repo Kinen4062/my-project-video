@@ -47,3 +47,14 @@ test_videos/*
 screenshot*.jpg
 screenshot*.png
 depth_output.jpg
+
+# 【安全】在线字幕匹配的 API key
+# ------------------------------------------------------------
+# 正常情况它存在 %APPDATA%/final_player/online.json —— 在项目目录**之外**，
+# git 本来就看不到（playlist.json / positions.json 也是这么放了 6 轮）。
+# 下面几行是**兜底**：万一这个文件被手动复制进项目目录（备份、迁移、误操作），
+# 也不许它进版本库。key 一旦进了 git 历史，删文件是没用的 —— 历史里还在，
+# 只能重写历史或者去 OpenSubtitles 后台作废重发。多写几行换这个保险，值。
+online.json
+*online.json
+final_player_config.json

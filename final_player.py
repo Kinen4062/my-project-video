@@ -7,7 +7,7 @@ import uuid      # 【P1】每次转换生成唯一临时文件名，避免互�
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 import cv2
 import torch
 import numpy as np
@@ -15,6 +15,7 @@ from PIL import Image, ImageTk
 import threading
 import time
 import math
+import queue      # 【第 20 轮】后台线程 → 主线程的唯一安全通道（见 _poll_online）
 from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 from ffpyplayer.player import MediaPlayer
 
@@ -50,6 +51,10 @@ import viewfit
 import playlist_store
 import resume_store
 import subtitle
+# 【第 20 轮·在线字幕匹配】去 OpenSubtitles 要一份现成的字幕。
+# 与其它本地模块同一路子：纯逻辑、不碰 Tk、网络层可注入（所以它能离线测）。
+# **不引入任何新依赖** —— 它只用已经装好的 requests。
+import subtitle_online
 import filedrop
 # 下面这个名字只是**再导出**：实现已经不在本文件里了，
 # 但测试套件引用 `final_player.has_audio_stream`，所以要留着。
@@ -380,6 +385,11 @@ SUBTITLE_BAR_COLOR_BGR = (12, 12, 12)
 SUBTITLE_BAR_FONT_RATIO = 0.30     # 栏里的字号按**栏高**算（栏是固定高度的一条）
 SUBTITLE_BAR_FONT_MIN = 13
 SUBTITLE_BAR_FONT_MAX = 40
+
+# 【第 20 轮】在线匹配：主线程多久看一次后台线程的结果（毫秒）。
+# 80ms 是"手感"和"开销"的折中 —— 匹配本身要好几秒，轮询再密也只是白烧 CPU，
+# 再疏就会让"匹配完成"明显滞后于实际完成。
+ONLINE_POLL_INTERVAL_MS = 80
 
 # ============================================================
 # 【第 11 轮·新】转换产物补回音轨
@@ -787,6 +797,29 @@ class VideoPlayerApp:
             value=SUBTITLE_MODE_LABELS[SUBTITLE_DEFAULT_MODE])
         self.subtitle_bar_var = tk.BooleanVar(value=False)
 
+        # 【第 20 轮·新】在线匹配的几个状态位。
+        #   · `online_api_key` —— 从用户配置目录读进来的 key（**首次用到才读**，
+        #     见 `_online_api_key`：这个方法按约定只做纯状态初始化、不碰文件）。
+        #     **绝不写死在代码里、绝不进版本库**：官方要求一个应用一个 key，
+        #     而这个程序只在这台机器上给你自己用，走的也是你自己的每日配额。
+        #     读失败就是空串（见 subtitle_online.load_config，它不抛）。
+        #   · `_online_busy`    —— 同一时刻只允许一个匹配在跑（网络慢，
+        #     连点几下会开好几条线程、白烧配额）。
+        #   · `_online_tried`   —— 视频路径 → 已经下过的 file_id 集合。
+        #     用户对匹配结果不满意时再点一次，会**往前推进到下一条候选**，
+        #     而不是把同一条又下一遍（那样既费配额又永远拿到同一份）。
+        #     按路径分开记：换一部片子就该从头挑。
+        self.online_api_key = None
+        self._online_busy = False
+        self._online_tried = {}
+        # 【第 20 轮】后台线程的结果通过这条队列回到主线程。
+        # ⚠️ 别改成"后台线程直接调 root.after" —— 那会抛
+        # `RuntimeError: main thread is not in main loop`（只有 mainloop
+        # 正在转的时候才侥幸不炸），而且**后台线程抓不到这个异常**，
+        # 结果是 `_online_busy` 永远停在 True、按钮永远点不动。实测踩过。
+        self._online_queue = None
+        self._online_thread = None
+
     def _build_video_area(self):
         """顶层 grid 布局 + 视频显示区（video_container / video_label）。
 
@@ -992,6 +1025,18 @@ class VideoPlayerApp:
             highlightthickness=0, bd=0,
         )
         self.subtitle_bar_check.pack(side=tk.LEFT, padx=(10, 0))
+
+        # 【第 20 轮·新】在线匹配（左键匹配 / 右键改 API key）。
+        # 放在这一组的末尾：它跟"字幕模式 / 载入字幕 / 字幕栏"是同一件事的
+        # 不同来路 —— 前面几个都是"字幕已经在手上了怎么显示"，这个是
+        # "手上还没有，去弄一份来"。
+        # ⚠️ 右键改 key 是刻意做成隐晦入口的：配一次就不用再动，
+        # 摆在明面上会占掉底栏本来就紧张的位置（见 F1 里的说明）。
+        self.btn_online = tk.Button(
+            self.aux_frame, text="在线匹配",
+            command=self.match_subtitles_online, **BTN_NORMAL)
+        self.btn_online.pack(side=tk.LEFT, padx=(10, 0))
+        self.btn_online.bind("<Button-3>", lambda _event: self.open_online_settings())
 
         # --- 视差与左右眼控制栏（仅 3D 模式有意义，见 _sync_parallax_visibility）---
         self.parallax_frame = tk.Frame(self.root, bg=DARK_BG)
@@ -1762,6 +1807,237 @@ class VideoPlayerApp:
         self._sync_subtitle_ui()
         self.render_current_frame()
         self._set_playlist_status(self._subtitle_status_text())
+
+    # ============================================================
+    # 【第 20 轮】在线字幕匹配（OpenSubtitles）
+    # ------------------------------------------------------------
+    # 为什么整条流程必须丢进后台线程：一轮匹配最坏是「3 次搜索 + 1 次下载」，
+    # 每次都可能一直卡到超时。跑在主线程上就是**界面直接冻住** —— Tk 的事件
+    # 循环被阻塞，连窗口重绘都不会发生，看起来像程序死了。
+    #
+    # 结果怎么回到主线程：**队列 + 主线程轮询**，而不是「后台线程里直接调
+    # root.after」。后者看着更省事，实测会抛
+    # `RuntimeError: main thread is not in main loop` —— 它只在 mainloop
+    # 正好转着的时候才侥幸不炸；更糟的是这个异常**后台线程自己抓不住**，
+    # 于是 `_online_busy` 永远停在 True、按钮从此点不动（只能重启程序）。
+    #
+    # 现在分工很清楚：后台线程只干两件事 —— 干活、把结果塞进
+    # `queue.Queue`（它本身线程安全）；`after` 全部由主线程发起
+    # （`match_subtitles_online` 起头 → `_poll_online` 自我续期，
+    # 而 `_poll_online` 本来就是被主线程的 after 调起来的）。
+    #
+    # ⚠️ 后台线程里**绝不能碰任何 Tk 对象**，连 `winfo_exists()` 都会炸 ——
+    # Tk 不是线程安全的（第 16 轮在字幕预热那里踩过）。
+    # ============================================================
+
+    def _online_api_key(self):
+        """当前可用的 API key。**首次用到才读配置**。
+
+        初始化时不读（那时按约定只做纯状态初始化、不碰文件系统）——
+        代价就是第一次点【在线匹配】会多一次很小的读盘。
+        """
+        if self.online_api_key is None:
+            self.online_api_key = subtitle_online.load_config().get("api_key", "")
+        return self.online_api_key
+
+    def open_online_settings(self):
+        """填 / 改 OpenSubtitles 的 API key（底栏【在线匹配】上点右键）。
+
+        返回 True 表示手上有一个非空的 key 可用。
+        """
+        current = self._online_api_key()
+        if current:
+            shown = ("%s……%s" % (current[:6], current[-4:])
+                     if len(current) > 12 else "（已设置）")
+        else:
+            shown = "（还没设置）"
+
+        messagebox.showinfo(
+            "在线字幕匹配 · 需要一个 API key",
+            "从 OpenSubtitles 自动匹配字幕，需要一个免费的 API key。\n\n"
+            "申请步骤（大约 1~2 分钟）：\n"
+            "  1. 打开 opensubtitles.com，注册并验证邮箱\n"
+            "  2. 右上角头像 → API consumers → NEW CONSUMER\n"
+            "  3. Name 随便填，Allow anonymous 选 true，保存\n"
+            "  4. 复制生成的 API Key，粘到下一步的输入框\n\n"
+            "小提示：把这个 consumer 设成 Under Development，\n"
+            "未登录也能有 100 次/天的下载额度（不设的话只有 5 次）。\n\n"
+            "以后想改：右键点底栏的【在线匹配】。\n\n"
+            "当前 key：%s" % shown)
+
+        new_key = simpledialog.askstring(
+            "OpenSubtitles API key",
+            "把 API Key 粘到这里（留空 = 清除）：",
+            initialvalue=current or "")
+        if new_key is None:
+            return False                 # 用户按了取消
+        new_key = new_key.strip()
+
+        if not subtitle_online.save_config({"api_key": new_key}):
+            # 存不下也**不拦着用户用** —— 本次仍按输入的 key 走，只是下次要重填
+            messagebox.showwarning(
+                "没能保存配置文件",
+                "写不进这个位置：\n%s\n\n"
+                "本次仍可用刚输入的 key，但下次启动需要重新填写。"
+                % subtitle_online.default_config_path())
+
+        self.online_api_key = new_key
+        self._set_playlist_status(
+            "已保存字幕源的 API key" if new_key else "已清除字幕源的 API key")
+        return bool(new_key)
+
+    def match_subtitles_online(self):
+        """底栏【在线匹配】：取一份字幕放到视频旁边，顺手装上。
+
+        每次点都**往前推进一条候选**（见 `_online_tried`）—— 对结果不满意
+        就直接再点一次，不用去找什么"换一个"的菜单。
+        """
+        if self._online_busy:
+            self._set_playlist_status("上一个匹配还在跑，稍等一下")
+            return
+
+        target = self.current_video_path
+        if not target or not os.path.exists(target):
+            messagebox.showinfo("先打开一个视频",
+                                "还没有正在播放的视频，没法匹配字幕。")
+            return
+
+        if not self._online_api_key() and not self.open_online_settings():
+            return
+        api_key = self._online_api_key()
+        if not api_key:
+            return
+
+        self._online_busy = True
+        self.btn_online.config(text="匹配中…", state=tk.DISABLED)
+        self._set_playlist_status("正在匹配字幕…")
+
+        # ⚠️ fps 必须在这里（主线程）读出来当**参数**传进去，不能让后台线程
+        # 自己去读 app 状态。另外：只有真的开了视频才把 fps 传下去 ——
+        # `video_fps` 的默认值是 30.0，拿它去匹配会让 23.976 的片子被判成
+        # "帧率不符"（传 0 = 不知道，就不会误罚）。
+        video_fps = self.video_fps if self.cap is not None else 0.0
+
+        # 每次匹配都用一条**全新**的队列：不然上一次残留的结果会被这一次
+        # 捡走，出现"点了没反应却突然跳到上一个结果"。
+        self._online_queue = queue.Queue()
+        self._online_thread = threading.Thread(
+            target=self._online_worker, args=(target, api_key, video_fps),
+            name="subtitle-online", daemon=True)
+        self._online_thread.start()
+        # 轮询由**主线程**发起（本方法就在主线程里跑），之后每次续期也由
+        # `_poll_online` 自己发起 —— 整条链上 `after` 都不会跨线程调用。
+        self.root.after(ONLINE_POLL_INTERVAL_MS, self._poll_online)
+
+    def _online_worker(self, video_path, api_key, video_fps):
+        """后台线程：搜 → 挑 → 下载 → 解压 → 落盘。
+
+        **只往队列里放一个元组，不碰任何 Tk 对象。** 成功和失败共用一个回程
+        （元组第一项区分），主线程那边就只有一个入口要看。
+        """
+        try:
+            client = subtitle_online.OpenSubtitles(api_key)
+            result = subtitle_online.fetch(
+                client, video_path, video_fps,
+                tried=self._online_tried.get(video_path, set()))
+            payload = ("ok", video_path, result)
+        except Exception as exc:
+            payload = ("error", str(exc),
+                       isinstance(exc, subtitle_online.NoAPIKey),
+                       isinstance(exc, subtitle_online.QuotaExceeded))
+        try:
+            self._online_queue.put(payload)
+        except Exception:
+            # 队列已经被换掉了（用户关掉又重开了一次匹配）—— 这条结果作废
+            pass
+
+    def _poll_online(self):
+        """主线程：看后台线程有没有结果。**只允许主线程调用。**
+
+        用轮询而不是让后台线程回调，代价是最多 80ms 的延迟，换来的是
+        「`after` 永远在主线程里被调用」这条硬保证 —— 那正是上面注释里
+        那个 RuntimeError 的来源。
+        """
+        if not self._online_busy:
+            return              # 窗口关了 / 已被别处收尾 → 停止续期，别再排自己
+
+        try:
+            payload = self._online_queue.get_nowait()
+        except queue.Empty:
+            # 还没好。先确认后台线程还活着，再排下一轮。
+            thread = self._online_thread
+            if thread is not None and not thread.is_alive():
+                # 线程没了却没留下结果 —— 只可能是它在放结果之前就崩了。
+                # **这里必须收尾**，否则按钮会永远停在「匹配中…」。
+                self._online_failed("匹配线程意外结束，请再试一次")
+                return
+            self.root.after(ONLINE_POLL_INTERVAL_MS, self._poll_online)
+            return
+        except Exception:
+            self._online_failed("匹配结果读不出来，请再试一次")
+            return
+
+        if payload[0] == "ok":
+            self._online_done(payload[1], payload[2])
+        else:
+            self._online_failed(payload[1], payload[2], payload[3])
+
+    def _online_done(self, video_path, result):
+        """主线程：把拿到的字幕装上、恢复按钮、报告结果。"""
+        self._online_busy = False
+        self.btn_online.config(text="在线匹配", state=tk.NORMAL)
+
+        # 记下来，下次点同一部片子时跳过它（"再点一次 = 换一条"）
+        self._online_tried.setdefault(video_path, set()).add(
+            result["candidate"]["file_id"])
+
+        # 用 explicit_path 装上：这条路不受"自动找同名字幕"开关影响。
+        # 直接给路径还有个好处 —— 若视频旁边已经有用户自己的字幕，新下的这份
+        # 会以 `电影.zh.1.srt` 落盘（绝不覆盖），此时按路径显式加载，
+        # 用户**立刻**就能看到刚下回来的这份。
+        self._load_subtitles(video_path, explicit_path=result["path"])
+
+        # 用户点的就是"我要看字幕"。原本是「关闭」的话顺手打开，
+        # 否则下完了什么都不显示，会让人以为没成功（跟【载入字幕】一个道理）。
+        if self.subtitle_mode == "off":
+            self.subtitle_mode = SUBTITLE_DEFAULT_MODE
+            self._sync_subtitle_ui()
+        self.render_current_frame()
+
+        notes = ["已匹配 %s" % result["description"]]
+        remaining = result["meta"].get("remaining")
+        if remaining is not None:
+            # 官方只在下载那一刻告诉你还剩几次，所以这里一定要露给用户看
+            notes.append("今天还剩 %s 次" % remaining)
+        notes.append("存到 %s" % os.path.basename(result["path"]))
+        self._set_playlist_status(" · ".join(notes))
+
+    def _online_failed(self, message, needs_key=False, quota=False):
+        """主线程：把失败说清楚（说清"为什么"和"接下来能做什么"）。"""
+        self._online_busy = False
+        self.btn_online.config(text="在线匹配", state=tk.NORMAL)
+        self._set_playlist_status("字幕匹配失败：%s" % message)
+
+        if needs_key:
+            if messagebox.askyesno("需要 API key",
+                                   "%s\n\n现在去配置吗？" % message):
+                self.open_online_settings()
+            return
+
+        if quota:
+            messagebox.showwarning(
+                "下载额度用完了",
+                "%s\n\n"
+                "免费额度按天算。想多要一些的话，去 opensubtitles.com 把你自己\n"
+                "那个 consumer 设成 Under Development（100 次/天）；\n"
+                "或者登录账号（20 次/天）。\n\n"
+                "实在不行也可以点【载入字幕】手动指定一个文件。" % message)
+            return
+
+        messagebox.showinfo("没能匹配到字幕",
+                            "%s\n\n可以：\n"
+                            "· 再点一次【在线匹配】（会换下一条候选）\n"
+                            "· 点【载入字幕】手动指定一个文件" % message)
 
     def _load_subtitles(self, video_path, explicit_path=None):
         """给这个视频装配字幕（自动找同名 / 用指定文件）。
@@ -2904,6 +3180,12 @@ class VideoPlayerApp:
             "· 字幕默认画在画面内底部（所有播放器都这样）。觉得遮挡画面 —— 尤其\n"
             "  是看 3D 的时候 —— 就按 B 或勾上【字幕栏】：窗口底部会切出一条\n"
             "  纯色横条专放字幕，字幕再也不压画面，代价是画面小一点\n\n"
+            "没有字幕文件？【在线匹配】可以直接去 OpenSubtitles 下一份：\n"
+            "· 它按视频文件的指纹精确匹配（比按片名搜准得多），优先挑中英双语，\n"
+            "  其次简体。下好的字幕存到视频旁边并自动加载\n"
+            "· 对结果不满意就**再点一次**：会换下一条候选，不会重复下同一份\n"
+            "· **绝不覆盖**你已有的字幕文件 —— 重名就退成 电影.zh.1.srt\n"
+            "· 第一次用需要填一个免费的 API key（右键点【在线匹配】可以改）\n\n"
             "播放列表（右侧那一栏）：\n"
             "· 可以直接把视频文件从资源管理器拖进窗口，拖进来就开始播\n"
             "· 双击列表条目播放它；播完自动播下一项（列表末尾回到第一项）\n"
@@ -3484,6 +3766,11 @@ class VideoPlayerApp:
         #    还活着的那个读；而且第 2 步之后 play_state 就成 IDLE 了。
         #    （用户关了播放器、过几天再打开，能接着上次看，靠的就是这一句。）
         self._settle_current_position()
+
+        # 0.5 【第 20 轮】让在线匹配的轮询停下来。它在主线程上**自我续期**，
+        #     窗口都销毁了还继续排 after，只会换来一串
+        #     "invalid command name ..._poll_online"。
+        self._online_busy = False
 
         # 1. 通知转换线程退出（不等待，它是 daemon 线程）
         if self.is_converting:

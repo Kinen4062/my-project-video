@@ -40,7 +40,7 @@ TMP_ROOT = os.path.join(os.environ.get("TEMP", "/tmp"), "fp_tests")
 # 语法检查只读源码、在内存里编译 —— 不写 __pycache__（见文件头第 1 条）
 SYNTAX_TARGETS = ("final_player.py", "media_tools.py", "depth3d.py", "viewfit.py",
                   "filedrop.py", "playlist_store.py", "resume_store.py",
-                  "subtitle.py")
+                  "subtitle.py", "subtitle_online.py")
 SYNTAX_CHECK_CODE = (
     "import sys\n"
     "for p in sys.argv[1:]:\n"
@@ -98,6 +98,7 @@ def build_plan(full=False, quick=False):
         ("播放列表与拖放", [os.path.join(TESTS, "test_playlist.py")]),
         ("记忆播放位置", [os.path.join(TESTS, "test_resume.py")]),
         ("双语字幕", [os.path.join(TESTS, "test_subtitles.py")]),
+        ("在线字幕匹配", [os.path.join(TESTS, "test_online_subtitles.py")]),
         ("音轨探测", [os.path.join(TESTS, "test_audio_probe.py")]),
         ("转换补音轨", [os.path.join(TESTS, "test_audio_mux.py")]),
         ("稳态速度", [os.path.join(TESTS, "test_speed.py")]),
