@@ -95,6 +95,7 @@ def build_plan(full=False, quick=False):
         ("定时器与挂起请求", [os.path.join(TESTS, "test_timers.py")]),
         ("快捷键与逐帧步进", [os.path.join(TESTS, "test_shortcuts.py")]),
         ("播放列表与拖放", [os.path.join(TESTS, "test_playlist.py")]),
+        ("音轨探测", [os.path.join(TESTS, "test_audio_probe.py")]),
         ("转换补音轨", [os.path.join(TESTS, "test_audio_mux.py")]),
         ("稳态速度", [os.path.join(TESTS, "test_speed.py")]),
     ]

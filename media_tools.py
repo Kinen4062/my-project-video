@@ -24,22 +24,42 @@ FFMPEG_MUX_TIMEOUT_SEC = 300      # 单次 mux 的超时；超时即放弃音轨
 FFMPEG_AUDIO_BITRATE = "160k"     # 音轨重新编码成 aac 的码率（原轨可能是任意格式）
 
 
-def has_audio_stream(ffmpeg, path):
-    """判断媒体文件里有没有音轨。
+def probe_audio_stream(ffmpeg, path):
+    """探测媒体文件里有没有音轨。**三态**返回：
+
+        True  —— 确认有音轨
+        False —— 确认没有音轨
+        None  —— 探测不了（没给 ffmpeg 路径 / 子进程起不来 / 超时），下不了结论
 
     用 `ffmpeg -i` 的 stderr 里有没有 "Audio:" 字样来判断，**不依赖 ffprobe**
     （ffpyplayer 那份 wheel 里只有 ffmpeg.exe，没有 ffprobe.exe）。
     注意：`ffmpeg -i xxx` 不带输出参数时退出码就是 1，属正常，不能拿退出码判断。
+
+    【第 16 轮】为什么要分三态：两个调用方对"不确定"的**默认值正好相反**。
+      · 补音轨（mux）问的是"要不要补" —— 不确定时按**不需要**处理（少做一件事
+        不会有副作用），所以 `has_audio_stream()` 保持原来的二态语义；
+      · 播放器问的是"要不要建音频播放器" —— 不确定时必须按**需要**处理
+        （多建一个没用的播放器只是浪费，而漏建会让本来有声音的文件永久静音）。
+    一个函数同时满足两种相反的默认值，只能靠调用方各自解释 None。
     """
-    if not ffmpeg:
-        return False
+    if not ffmpeg or not path:
+        return None
     try:
         proc = subprocess.run([ffmpeg, "-hide_banner", "-i", path],
                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                               timeout=60)
     except Exception:
-        return False
+        return None
     return b"Audio:" in (proc.stderr or b"")
+
+
+def has_audio_stream(ffmpeg, path):
+    """判断媒体文件里有没有音轨（补音轨用）。
+
+    二态：只有**确认有**才返回 True。探测不了也算 False —— 这是 mux 场景要的
+    默认值（判断不了就别去动人家的音轨）。三态的原始接口见 probe_audio_stream。
+    """
+    return probe_audio_stream(ffmpeg, path) is True
 
 
 def remove_quietly(path):

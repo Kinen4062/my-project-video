@@ -207,6 +207,15 @@ AUDIO_VOLUME_RESUME_POLL_MS = 10   # 抢发窗口里的音量重试间隔（比�
                                    # 免得"音频已经出声、音量还没落到位"）
 AUDIO_CLOCK_REWIND_EPS = 0.01     # 音频时钟读数回跳超过这么多就判定为抖动，不采信
 AUDIO_VOLUME_SYNC_DELAY = 0.4     # 还没确认"播放器真有音轨"时，隔多久重试一次音量
+# 【第 16 轮·新】"这个文件有没有音轨"的探测缓存条数上限。
+# 每次探测要起一个 ffmpeg 子进程（实测 ~120ms），所以结论按
+# `(绝对路径, 文件大小, 修改时间)` 缓存 —— 同一个文件第二次打开是 0ms，
+# 而文件被重新转换/替换（大小或时间变了）时缓存会自动失效。
+AUDIO_PROBE_CACHE_MAX = 32
+# 启动后预探测播放列表里前多少个文件（见 _warm_audio_probe_cache）。
+# 用户点列表往往是连着点的，趁空闲先算好，点哪个都是 0ms。
+AUDIO_PROBE_WARM_MAX = 20
+AUDIO_PROBE_WARM_DELAY_MS = 1000  # 启动后隔多久开始预热（先让界面和首次播放就位）
 
 # 【第 11 条修复】音画同步改用"音频主时钟"
 # ------------------------------------------------------------
@@ -1057,6 +1066,18 @@ class VideoPlayerApp:
         self.audio_volume = 1.0  # 音量 0.0 ~ 1.0
         self.audio_muted = False  # 是否静音
         self.audio_failed = False  # 【P1】音频初始化失败后不再每帧重建
+        # 【第 16 轮·新】当前文件到底有没有音轨。三态（见 _probe_audio_track）：
+        #   None  = 还没探测 / 探测不了（缺 ffmpeg）→ 按"有音轨"处理，照常建播放器
+        #   True  = 有音轨 → 正常
+        #   False = 确认没有 → **根本不建音频播放器**（见 open_video 里那一段）
+        self.current_has_audio = None
+        # 探测结论的缓存，键是 (绝对路径, 文件大小, 修改时间)。
+        # 这个探测要起 ffmpeg 子进程（~120ms），而用户点列表时是连着点的。
+        self._audio_probe_cache = {}
+        # 启动后是否预热列表文件的音轨结论（见 _warm_audio_probe_cache）。
+        # 测试基架（tests/_harness.py）会把它关掉：预热线程会起 ffmpeg 子进程，
+        # 跟"连续切换耗时 <150ms"这类断言抢磁盘和 CPU，让结果变得不确定。
+        self._audio_probe_warm_enabled = True
         # 【第 11 条修复】音频主时钟的基准：
         #   _audio_progress_ref —— 音频时钟的参考读数（None = 尚未校准）
         #   _audio_clock_base   —— 校准时视频所在位置（秒），主时钟以此为起点
@@ -1162,6 +1183,13 @@ class VideoPlayerApp:
         if not self._dnd_enabled:
             # 拖放是可选增强（非 Windows 没有）：说清楚，别让人以为程序坏了
             self._set_playlist_status("本平台不支持拖放；请用【添加】按钮")
+
+        # 【第 16 轮·新】趁空闲把播放列表里各文件的"有没有音轨"先探好 ——
+        # 探测一次要 ~120ms，用户点列表是连着点的，先算好就每次都是 0ms
+        # （见 _warm_audio_probe_cache）。用 after 延后启动，让界面和首次播放
+        # 先就位；不必登记这个 after id —— destroy 之后 Tk 不会再触发它。
+        # 开关在方法里判（测试基架会关掉它）。
+        self.root.after(AUDIO_PROBE_WARM_DELAY_MS, self._warm_audio_probe_cache)
 
     # ============================================================
     # 【P2 修复】播放状态的两个"视图"属性
@@ -1315,6 +1343,15 @@ class VideoPlayerApp:
             messagebox.showerror("错误", "无法打开视频文件")
             return False
 
+        # 【第 16 轮·新】先探测这个文件有没有音轨（结论在上面 _create_audio_player
+        # 那里用得上：没有音轨就根本不建播放器）。
+        #
+        # ⚠️ **必须在"摘掉旧播放器"之前**做。探测要起一个 ffmpeg 子进程（实测
+        #    ~120ms）。放在"摘旧 → 建新"之间的话，这 120ms 里旧音频已经摘掉、
+        #    新音频还没建，会白断一小段声音；放在这里，这 120ms 旧音频照常出声，
+        #    后面那段"摘旧 → 建新"的间隙仍然是原来的 ~2ms。
+        has_audio = self._probe_audio_track(file_path)
+
         # 处理旧的音频播放器 —— 【第 15 轮·重写】不再同步 close_player()
         #
         # 原来这里是 _cancel_audio_handoff() + _close_audio_player()，后者会调
@@ -1345,6 +1382,12 @@ class VideoPlayerApp:
         self._silent_clock_base = None      # 换了文件，墙钟主时钟重新对表
         self._last_media_sec = 0.0          # 音频交接用的"当前视频位置"也归零
         self.audio_failed = False  # 换文件后允许重试一次音频
+        # 【第 16 轮·新】把上面探测的结论落地（为什么必须连 audio_failed 一起置，
+        # 见 _probe_audio_track 的说明；探测不了 = None 时**不置**，
+        # 宁可多建一个播放器也不能把真有音轨的文件搞成永久静音）。
+        self.current_has_audio = has_audio
+        if has_audio is False:
+            self.audio_failed = True
         # 【第 11 轮修复】换了文件，"为拖动挂起"的豁免不能跨文件残留
         self._mark_audio_live()
         self.btn_play.config(text="暂停")
@@ -2685,6 +2728,93 @@ class VideoPlayerApp:
         self._audio_frozen_since = None
         self._audio_started_at = time.time()
 
+    def _probe_audio_track(self, file_path):
+        """探测文件有没有音轨。返回 True / False / None（None = 探测不了）。
+
+        【第 16 轮·新】为什么提前探测，而不是"先建播放器、再看时钟死不死"
+        （原来就是那么干的，代价记在文件顶部第 5 条）：
+
+        1. **那行让人以为"打开失败"的报错就是从这儿来的。** 给没有音轨的文件建
+           MediaPlayer，ffpyplayer 的读线程必然配不起 filtergraph，于是往 stderr
+           打一条 FATAL：`Failed to open file '...' or configure filtergraph`。
+           它**产生于打开文件那一刻**，但 Windows 上 stderr 一旦不是终端就是
+           **块缓冲**（4KB），这几十个字节填不满，于是一直扣在 C 运行时的缓冲里，
+           直到进程退出、os._exit 触发 CRT 的 flush 才冲出来。表现出来就是
+           "一关播放器就冒出一行打开失败"，看着像关闭动作把播放搞坏了，其实两者
+           毫无关系（实测：开文件时就有，只是当时看不见）。
+           要让它彻底不出现，唯一的办法就是**不建那个播放器**。
+
+        2. **那个播放器从头到尾没有用处** —— 文件里没有音频流，它只会白占一条
+           SDL 混音通道和一颗 ffpyplayer 线程，还得在换文件时陪着走一遍 close
+           （那正是第 15 轮花大力气挪去后台的操作）。
+
+        3. **省掉一条 1.5 秒的弯路**：原来要等死时钟检测攒够
+           AUDIO_CLOCK_STALL_SEC 才判死、才转用墙钟主时钟，这期间画面按帧率盲走。
+           提前知道没有音轨，第一帧就能直接用墙钟（见 open_video 里设
+           audio_failed 那两行）。
+
+        代价是起一个 ffmpeg 子进程，实测 ~120ms，所以结论按文件指纹缓存。
+        只缓存**有结论**的结果：探测失败多半是"这一次读不到"，缓存下来等于把
+        偶然失败固化成结论（到时候真有音轨的文件会被永久静音，那是本末倒置）。
+        """
+        if not file_path:
+            return None
+        try:
+            key = (os.path.abspath(file_path), os.path.getsize(file_path),
+                   os.path.getmtime(file_path))
+        except OSError:
+            key = None                      # 拿不到指纹就不缓存，照常探测
+        if key is not None and key in self._audio_probe_cache:
+            return self._audio_probe_cache[key]
+
+        result = media_tools.probe_audio_stream(find_ffmpeg(), file_path)
+
+        if key is not None and result is not None:
+            if len(self._audio_probe_cache) >= AUDIO_PROBE_CACHE_MAX:
+                self._audio_probe_cache.clear()
+            self._audio_probe_cache[key] = result
+        return result
+
+    def _warm_audio_probe_cache(self):
+        """趁空闲把播放列表里各文件的音轨结论先算出来。
+
+        【第 16 轮·新】探测要起一个 ffmpeg 子进程（实测 ~120ms）。用户点列表
+        常常是连着点的，每次都现探就会一卡一卡 —— 而列表在启动时就确定了，
+        完全可以先算好，之后点哪个都是 0ms（缓存命中）。
+
+        三条纪律：
+          · 线程里只调 `_probe_audio_track`（只读文件 + 写缓存），**不碰任何
+            播放状态**，所以与主线程并行是安全的。缓存是普通 dict，CPython 下
+            单个 get/set 原子；最坏情况不过是同一条目被探两次。
+          · **先在这边（主线程）调一次 `find_ffmpeg()`** —— 它背后那对全局缓存
+            （`_FFMPEG_PATH` / `_FFMPEG_SEARCHED`）是懒搜索的，放在后台线程里
+            首次命中会触发一次文件系统全盘查找。
+          · 最少 2 个文件才值得预热（一个文件的探测成本反正躲不掉，还白起线程），
+            只预热确实存在的文件，线程是 daemon：列表再长、某个文件在慢盘上，
+            也不会拖住退出。
+        """
+        if not self._audio_probe_warm_enabled:
+            return
+        ffmpeg = find_ffmpeg()
+        if not ffmpeg:
+            return
+        targets = [p for p in self.playlist[:AUDIO_PROBE_WARM_MAX]
+                   if p and os.path.isfile(p)]
+        if len(targets) < 2:
+            return
+
+        def work():
+            # ⚠️ 这里**只**做探测。别在后台线程里碰 Tk（连 winfo_exists 这种
+            #    "只读"调用也不行 —— Tk 不是线程安全的）。要到"窗口没了就停"
+            #    的效果，用主线程能看见的普通标志，而不是问 Tk。
+            for path in targets:
+                try:
+                    self._probe_audio_track(path)
+                except Exception:
+                    pass
+
+        threading.Thread(target=work, name="audio-probe-warm", daemon=True).start()
+
     def _create_audio_player(self, file_path, start_sec=0.0):
         """**同步**创建音频播放器（构造本身只要 ~1.6ms）。
 
@@ -2694,7 +2824,11 @@ class VideoPlayerApp:
         否则又回到"关旧播放器卡主线程"的老问题。
         返回创建的 MediaPlayer；失败返回 None 并置 audio_failed。
         """
-        if not file_path or self.audio_failed:
+        # 【第 16 轮】多一条 `current_has_audio is False` 的保险。open_video 那时
+        # 已经把 audio_failed 一并置上了（两处是同一个判断的两道门），这里再拦一次
+        # 是为了防止将来的新调用点漏掉那步 —— 代价只是多一个判断，而漏掉的后果是
+        # 白建一个没用的播放器 + 又冒出那行误导人的报错。
+        if not file_path or self.audio_failed or self.current_has_audio is False:
             return None
 
         player = self._new_audio_player(file_path, start_sec)

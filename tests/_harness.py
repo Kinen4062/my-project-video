@@ -429,6 +429,12 @@ def load_app(geometry="1000x700", autoplay_next=False):
     root.update()
     app = fp.VideoPlayerApp(root, playlist_path=make_playlist_path())
     app.autoplay_next = autoplay_next
+    # 【第 16 轮】关掉"启动后预热列表文件音轨结论"的后台线程（见
+    # final_player._warm_audio_probe_cache）。它要起 ffmpeg 子进程，会跟
+    # test_playlist.py ⑪ 节那条"连续切换 <150ms"的断言抢磁盘和 CPU，让耗时
+    # 结果变得不确定 —— 而一个不确定的耗时断言等于没有断言。
+    # 预热本身另有专门的用例覆盖（tests/test_audio_probe.py 第 ⑤ 节）。
+    app._audio_probe_warm_enabled = False
     root.update()
     take_keyboard_focus(root)          # 见函数说明：不抢焦点则按键全被丢弃
     return root, app, fp

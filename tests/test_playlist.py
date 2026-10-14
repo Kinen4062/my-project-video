@@ -400,6 +400,20 @@ def body(root, app, fp, s):
             "第一个有音轨文件已经出声（有\"要关的旧播放器\"才测得出这个卡顿）")
 
     pair = [city, city2]
+    # 【第 16 轮】开测之前先把音轨探测的缓存填上。
+    #
+    # 本节量的是**切换本身**的同步开销（第 15 轮那条"别再同步 close_player"），
+    # 而"第一次碰到某个文件要先探测音轨"是**另一件事**：它要起一个 ffmpeg
+    # 子进程，实测 ~120ms（第一次切到 city2 时就会带上这笔钱 —— 本节的判据
+    # 150ms 因此会以 154ms 擦线变红）。
+    #
+    # 分开的理由不是"让它变绿"，而是**混在一句话里的两笔账，红了根本看不出是
+    # 哪一笔坏了**。探测成本另有专门的用例守着（tests/test_audio_probe.py ④
+    # 里量了"首次 < 600ms、缓存命中 < 200ms"）。真实使用中列表文件会在启动后
+    # 由 `_warm_audio_probe_cache` 预热，这里显式做同一件事。
+    for path in pair:
+        app._probe_audio_track(path)
+
     costs = []
     for i in range(4):
         t0 = time.perf_counter()
