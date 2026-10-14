@@ -427,7 +427,8 @@ def make_resume_path():
     return path
 
 
-def load_app(geometry="1000x700", autoplay_next=False, resume_enabled=False):
+def load_app(geometry="1000x700", autoplay_next=False, resume_enabled=False,
+             subtitles=False):
     """装载一个 app。
 
     `autoplay_next=False`（默认）会关掉**片尾自动续播** —— 老套件量的是
@@ -443,6 +444,13 @@ def load_app(geometry="1000x700", autoplay_next=False, resume_enabled=False):
     全部失去意义。加上 `resume_path` 也换成了临时文件（见 make_resume_path），
     用户的真实观看进度同样不会被写。
     续播自己的套件（tests/test_resume.py）显式传 True。
+
+    `subtitles=False`（默认）会关掉【第 18 轮】的双语字幕。
+    这一条纯粹是为了**护住那几条耗时断言**：字幕要在每帧渲染的收尾多贴一层
+    图层（缓存命中时 ~0.3ms，未命中时 ~3ms），而 test_playlist ⑪ 节量的是
+    "连续切换 <150ms"、test_speed 量的是倍速 —— 多出来的这点开销足以让它们
+    在临界值上抖成红色。字幕本身另有专门的套件覆盖
+    （tests/test_subtitles.py，它显式传 True）。
     """
     if PROJ not in sys.path:
         sys.path.insert(0, PROJ)
@@ -455,6 +463,7 @@ def load_app(geometry="1000x700", autoplay_next=False, resume_enabled=False):
                             resume_path=make_resume_path())
     app.autoplay_next = autoplay_next
     app.resume_enabled = resume_enabled
+    app.subtitle_enabled = subtitles
     # 【第 16 轮】关掉"启动后预热列表文件音轨结论"的后台线程（见
     # final_player._warm_audio_probe_cache）。它要起 ffmpeg 子进程，会跟
     # test_playlist.py ⑪ 节那条"连续切换 <150ms"的断言抢磁盘和 CPU，让耗时
@@ -513,15 +522,18 @@ def teardown(root, app):
         pass
 
 
-def run_suite(title, body, autoplay_next=False, resume_enabled=False):
+def run_suite(title, body, autoplay_next=False, resume_enabled=False,
+              subtitles=False):
     """套件统一入口：装载 → 跑 body(root, app, fp, summary) → 收尾 → 返回退出码
 
     `autoplay_next` 见 `load_app` 的说明（默认关，播放列表套件传 True）。
     `resume_enabled` 同（默认关，test_resume.py 传 True）。
+    `subtitles` 同（默认关，test_subtitles.py 传 True）。
     """
     summary = Summary(title)
     root, app, fp = load_app(autoplay_next=autoplay_next,
-                             resume_enabled=resume_enabled)
+                             resume_enabled=resume_enabled,
+                             subtitles=subtitles)
     try:
         body(root, app, fp, summary)
     finally:

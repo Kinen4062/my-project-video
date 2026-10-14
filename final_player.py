@@ -37,12 +37,19 @@ from ffpyplayer.player import MediaPlayer
 #   resume_store —— "上次看到哪儿"的落盘（同样是配置目录下的小 JSON）
 # 注意它的**姊妹关系**：两者都只管"数据怎么存"，"什么时候存"由本文件决定
 # （见 _settle_current_position）。这里再没有别的账要算。
+#
+# 【第 18 轮·字幕】还是同一个路子：
+#   subtitle —— SRT/VTT 的解析、找同名字幕、认语种、把文字渲染成图层
+# 它同样**不知道播放器存在**（不读 app 状态、不碰控件）。本文件只负责
+# "什么时候加载 / 显示哪一种 / 画在画面哪一处"，以及多出来的那两个控件的状态。
+# 分工与 media_tools / depth3d / viewfit 完全一致。
 # ============================================================
 import media_tools
 import depth3d
 import viewfit
 import playlist_store
 import resume_store
+import subtitle
 import filedrop
 # 下面这个名字只是**再导出**：实现已经不在本文件里了，
 # 但测试套件引用 `final_player.has_audio_stream`，所以要留着。
@@ -105,7 +112,9 @@ PLIST_MIN_WIDTH = 236
 # 下面每条都实测定过，不是照抄 Tk 文档推断的。
 
 _ARROW_KEYS = ("left", "right", "up", "down")
-_ALL_SHORTCUT_KEYS = _ARROW_KEYS + ("space", "m", "f", "j", "k", "l")
+# 【第 18 轮】多了 "v"（切换字幕模式）。加字母键只影响"让路矩阵"里那张
+# 输入框的清单（输入框本来就该吃掉所有字母键），所以规则表一行都不用改。
+_ALL_SHORTCUT_KEYS = _ARROW_KEYS + ("space", "m", "f", "j", "k", "l", "v")
 
 # 真正"要打字"的控件：空格打空格、方向键移光标、字母变输入内容 → 全让。
 TEXT_INPUT_WIDGETS = (tk.Entry, ttk.Entry, tk.Text)
@@ -313,6 +322,34 @@ CONVERSION_JOIN_TIMEOUT_SEC = 1.0
 #    按绝对秒数判，长片短片一视同仁。
 RESUME_MIN_POSITION_SEC = 5.0
 RESUME_TAIL_SEC = 5.0
+
+# ============================================================
+# 【第 18 轮·新】双语字幕
+# ------------------------------------------------------------
+# 需求：只支持中文字幕与英文字幕的双语字幕，其它语言留扩展位但不做。
+#
+# "双语"的落点：**字幕文字是画在"合成好的一整屏"上的**（见 render_current_frame），
+# 而不是做成一个 Tk 控件贴在画面下方。这么选有三个理由：
+#   ① 缩放/全屏/3D 模式/暂停重绘全都自动带上，不需要各自处理一遍；
+#   ② 字幕位置能跟着"视频画面那块矩形"走（有黑边时贴着视频底、而不是窗口底）；
+#   ③ 截图就是所见即所得。
+# 代价是每帧多一次 `paste` —— 所以文字本身按内容缓存成图层（见 subtitle.py）。
+#
+# 显示模式：关 / 中文 / 英文 / 中英双语。四种模式的名字在这里定义，
+# **顺序即 V 键的循环顺序**。
+SUBTITLE_MODES = ("off", "zh", "en", "both")
+SUBTITLE_MODE_LABELS = {"off": "关闭", "zh": "中文", "en": "英文", "both": "中英双语"}
+# 默认"中英双语"：有中英两条就上下两行一起显示，只有一种语言时自然只显示那一种
+# （见 SubtitleSet.lines_for）。这是"双语字幕"这个需求直接对应的默认值。
+SUBTITLE_DEFAULT_MODE = "both"
+
+# 字号 = 视频显示高度 × 这个比例（所以全屏时字幕会跟着变大）。
+SUBTITLE_FONT_SIZE_RATIO = 0.042
+SUBTITLE_FONT_SIZE_MIN = 14       # 窗口再小也要看得清（视频区只有 200px 高时按比例只有 8px）
+SUBTITLE_FONT_SIZE_MAX = 64       # 4K 全屏时别涨到糊脸
+SUBTITLE_WIDTH_RATIO = 0.92       # 一行字幕最多占视频宽度的比例，超了就折行
+SUBTITLE_BOTTOM_MARGIN_RATIO = 0.05   # 距视频画面底部留多少（按视频显示高度算）
+SUBTITLE_BOTTOM_MARGIN_MIN = 4
 
 # ============================================================
 # 【第 11 轮·新】转换产物补回音轨
@@ -555,6 +592,7 @@ class VideoPlayerApp:
         self._init_playback_state()
         self._init_playlist_state(playlist_path)
         self._init_resume_state(resume_path)
+        self._init_subtitle_state()
         self._build_video_area()
         self._build_progress_bar()
         self._build_control_bars()
@@ -679,6 +717,38 @@ class VideoPlayerApp:
         self._resume_positions = resume_store.load(self._resume_path)
         self.resume_enabled = True
         self._resume_ignored = set()
+
+    def _init_subtitle_state(self):
+        """【第 18 轮·新】字幕的**纯状态**（不建控件、不碰播放）。
+
+        必须在 `_build_control_bars` 之前跑完 —— 底栏那个"字幕模式"下拉框要拿
+        `self.subtitle_var` 当 variable（与 seek_var / mode_var 同一个道理）。
+
+        字段各自的理由：
+          · `subtitle_enabled` —— **总开关**。关掉后既不加载也不绘制，等于退回
+            第 17 轮的行为。测试基架默认关掉（见 tests/_harness.load_app）：
+            字幕要在每帧上多贴一层，会跟几条"帧间隔 / 切换耗时"的断言抢预算，
+            而一个不确定的耗时断言等于没有断言。
+          · `subtitle_auto`    —— 打开视频时要不要自动找同名字幕。
+            单独留一个开关是给"载入字幕（手动指定）"那条路用的：用户手选的文件
+            一律加 `subtitle_auto` 的判断，不因为开关关着就被忽略。
+          · `subtitle_mode`    —— 用户的意愿（关 / 中 / 英 / 中英）。**换文件不重置**：
+            选了"只看中文"就该一直是只看中文。
+          · `subtitle_set`     —— 当前视频可用的字幕（`SubtitleSet`，最多一中一英）。
+          · `subtitle_font_path` —— 找到的中文字体；None = 画不了字幕（见
+            `subtitle.find_font` 的说明，找不到就静默不画，绝不因此崩）。
+          · `_last_display_image` —— 上一次真正上屏的那一屏（PIL 图，含字幕与黑边），
+            截图用它做"所见即所得"。
+        """
+        self.subtitle_enabled = True
+        self.subtitle_auto = True
+        self.subtitle_mode = SUBTITLE_DEFAULT_MODE
+        self.subtitle_set = subtitle.SubtitleSet()
+        self.subtitle_font_path = subtitle.find_font()
+        self._subtitle_renderer = subtitle.SubtitleRenderer(self.subtitle_font_path)
+        self._last_display_image = None
+        self.subtitle_var = tk.StringVar(
+            value=SUBTITLE_MODE_LABELS[SUBTITLE_DEFAULT_MODE])
 
     def _build_video_area(self):
         """顶层 grid 布局 + 视频显示区（video_container / video_label）。
@@ -853,6 +923,26 @@ class VideoPlayerApp:
 
         self.btn_mute = tk.Button(self.aux_frame, text="🔊", command=self.toggle_mute, **BTN_NORMAL)
         self.btn_mute.pack(side=tk.LEFT, padx=5)
+
+        # 【第 18 轮·新】字幕：模式下拉 + 手动载入。
+        # 放在这一行（设置项）而不是主操作行 —— 它跟"3D模式/倍速/音量"是一类东西，
+        # 都是"改看法"的设置，不是"要执行"的动作；主操作行也早就挤满了。
+        tk.Label(self.aux_frame, text="字幕:", bg=DARK_BG,
+                 fg=DARK_FG).pack(side=tk.LEFT, padx=(15, 5))
+        self.subtitle_combo = ttk.Combobox(
+            self.aux_frame,
+            textvariable=self.subtitle_var,
+            values=[SUBTITLE_MODE_LABELS[mode] for mode in SUBTITLE_MODES],
+            width=8,
+            state="readonly",
+        )
+        self.subtitle_combo.pack(side=tk.LEFT)
+        self.subtitle_combo.bind("<<ComboboxSelected>>", self.on_subtitle_mode_change)
+
+        # 手动载入：名字跟视频对不上号的字幕文件（下载下来常叫 1.srt / chs.srt）
+        # 靠它救。自动找同名字幕是主路径，这个是兜底。
+        tk.Button(self.aux_frame, text="载入字幕",
+                  command=self.load_subtitle_file, **BTN_NORMAL).pack(side=tk.LEFT, padx=5)
 
         # --- 视差与左右眼控制栏（仅 3D 模式有意义，见 _sync_parallax_visibility）---
         self.parallax_frame = tk.Frame(self.root, bg=DARK_BG)
@@ -1457,6 +1547,8 @@ class VideoPlayerApp:
         if fg_w == win_w and fg_h == win_h:
             # 刚好铺满，直接用
             canvas = fg
+            # 【第 18 轮】字幕要贴着"视频画面那块矩形"底部，所以这里得记住它。
+            video_box = (0, 0, fg_w, fg_h)
         else:
             # 需要填充背景
             if fast:
@@ -1473,9 +1565,23 @@ class VideoPlayerApp:
             x0 = (win_w - fg_w) // 2
             y0 = (win_h - fg_h) // 2
             canvas[y0:y0 + fg_h, x0:x0 + fg_w] = fg
+            video_box = (x0, y0, fg_w, fg_h)
 
         cv2image = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGBA)
-        imgtk = ImageTk.PhotoImage(image=Image.fromarray(cv2image))
+        image = Image.fromarray(cv2image)
+        # 【第 18 轮·新】字幕画在这里 —— "整屏已经合成完、还没上屏"的那一刻。
+        #
+        # 为什么是这里（改前先想清楚）：所有让画面变化的路径（播放的每一帧、
+        # 缩放、全屏进出、切 3D 模式、暂停态重绘、拖进度条）最后都汇集到这一个
+        # 方法，字幕挂在它上面就自然全覆盖了，一处都不用另写。
+        # 而且它拿到的是 `video_box`（视频真正占的那块矩形），字幕因此贴着视频
+        # 底部而不是窗口底部 —— 有黑边时才不会飘到黑边里去。
+        # 没有字幕时这个方法第一句就返回，开销为零（老套件的耗时不变量靠它）。
+        self._compose_subtitles(image, video_box)
+        # 截图要"所见即所得"，所以把真正上屏的这一屏留一份
+        self._last_display_image = image
+
+        imgtk = ImageTk.PhotoImage(image=image)
         self.video_label.imgtk = imgtk
         self.video_label.config(image=imgtk)
 
@@ -1490,6 +1596,174 @@ class VideoPlayerApp:
         `render_current_frame` 里就是 `.copy()` 出去的。
         """
         return self._bg.get(frame, win_w, win_h)
+
+    # ============================================================
+    # 【第 18 轮·新】双语字幕
+    # ------------------------------------------------------------
+    # 分工：解析 / 找同名文件 / 认语种 / 排版折行 全在 `subtitle.py`，那边不知道
+    # 播放器存在。这里只做四件事 —— **什么时候加载、显示哪一种、画在哪儿、
+    # 状态行说什么**，跟前几轮的模块分工完全一致。
+    #
+    # 为什么把文字画进画面、而不是做一个 Tk 控件贴在视频下方：见 SUBTITLE_* 那组
+    # 常量上面的说明（缩放/全屏/3D/暂停重绘全自动带上 + 位置能跟着视频矩形走 +
+    # 截图所见即所得）。
+    # ============================================================
+    def _subtitle_filetypes(self):
+        patterns = " ".join("*" + ext for ext in subtitle.SUBTITLE_EXTS)
+        return [("字幕文件", patterns), ("SubRip 字幕", "*.srt"),
+                ("WebVTT 字幕", "*.vtt"), ("所有文件", "*.*")]
+
+    def load_subtitle_file(self):
+        """手动指定字幕文件（底栏【载入字幕】）。
+
+        自动找同名字幕是主路径；这个是兜底 —— 网上下的字幕常常叫
+        `1.srt` / `chs.srt` / `[某字幕组]电影.srt`，跟视频名字毫无关系。
+        """
+        if not self.subtitle_enabled:
+            self._set_playlist_status("字幕功能已关闭")
+            return
+        path = filedialog.askopenfilename(title="选择字幕文件",
+                                          filetypes=self._subtitle_filetypes())
+        if not path:
+            return
+        if not self.current_video_path:
+            self._set_playlist_status("先打开一个视频，再载入字幕")
+            return
+        self._load_subtitles(self.current_video_path, explicit_path=path)
+        if not self.subtitle_set.available:
+            messagebox.showwarning(
+                "字幕",
+                "这个文件里没读出字幕：\n%s\n\n"
+                "（支持 .srt / .vtt。空文件、只有时间轴没有文字、"
+                "以及根本不是字幕的文本文件都会是这个结果。）" % path)
+            return
+        # 用户主动载入 = 明确想看字幕。原本是"关闭"的话顺手打开，
+        # 否则载完什么都不显示，用户会以为没生效。
+        if self.subtitle_mode == "off":
+            self.subtitle_mode = SUBTITLE_DEFAULT_MODE
+        self._sync_subtitle_ui()
+        self.render_current_frame()
+        self._set_playlist_status(self._subtitle_status_text())
+
+    def _load_subtitles(self, video_path, explicit_path=None):
+        """给这个视频装配字幕（自动找同名 / 用指定文件）。
+
+        两个开关各管一段，别合并：
+          · `subtitle_enabled` —— 总开关，关掉就什么都不加载也不画（测试基架用）；
+          · `subtitle_auto`    —— 只管"打开视频时自动找同名字幕"这一条路。
+            手选的字幕文件（`explicit_path`）不受它影响：用户既然点名了，
+            就该认。
+        """
+        if (not self.subtitle_enabled
+                or (explicit_path is None and not self.subtitle_auto)):
+            self.subtitle_set = subtitle.SubtitleSet()
+        else:
+            self.subtitle_set = subtitle.build(video_path,
+                                               explicit_path=explicit_path)
+        self._sync_subtitle_ui()
+        return self.subtitle_set
+
+    def _sync_subtitle_ui(self):
+        """把当前模式刷到下拉框上。
+
+        下拉框**始终可用**，不因为"没找到字幕"就灰掉：它旁边就是【载入字幕】，
+        用户从这儿能看出现在是哪种模式，再点一下就载入一份。至于"为什么没显示
+        字幕"，交给状态行那句话解释（见 _subtitle_status_text）。
+        """
+        try:
+            self.subtitle_var.set(
+                SUBTITLE_MODE_LABELS.get(self.subtitle_mode, "关闭"))
+        except Exception:
+            pass
+
+    def _subtitle_status_text(self):
+        """状态行要说的那一句话。"""
+        if not self.subtitle_set.available:
+            return ("没有找到字幕文件 —— 把 .srt/.vtt 改成与视频同名放在旁边，"
+                    "或点【载入字幕】指定一个")
+        if not self.subtitle_font_path:
+            # 找不到字体时不画字幕（见 subtitle.find_font）。但**不能一声不吭**：
+            # 用户会觉得"字幕没生效"，而真相是这台机器缺字体。说清楚。
+            return "找到字幕了，但本机没有可用的中文字体，画不出来"
+        return "%s · %s" % (SUBTITLE_MODE_LABELS[self.subtitle_mode],
+                            self.subtitle_set.describe())
+
+    def on_subtitle_mode_change(self, event=None):
+        """下拉框选了新模式。"""
+        label = self.subtitle_var.get()
+        for mode, text in SUBTITLE_MODE_LABELS.items():
+            if text == label:
+                self.subtitle_mode = mode
+                break
+        self.render_current_frame()
+        self._set_playlist_status(self._subtitle_status_text())
+        # 焦点会留在下拉框身上（Tk 的 Combobox 选完就把焦点收在自己那儿），
+        # 之后空格/方向键都会被它吃掉 —— 跟"选完文件、点完按钮"是同一个毛病，
+        # 同样主动把焦点交回画面（见 _restore_shortcut_focus）。
+        self._restore_shortcut_focus()
+
+    def cycle_subtitle_mode(self):
+        """V 键：按 `SUBTITLE_MODES` 的顺序循环那四种模式。"""
+        modes = list(SUBTITLE_MODES)
+        index = modes.index(self.subtitle_mode) if self.subtitle_mode in modes else 0
+        self.subtitle_mode = modes[(index + 1) % len(modes)]
+        self._sync_subtitle_ui()
+        self.render_current_frame()
+        self._set_playlist_status(self._subtitle_status_text())
+
+    # ---------- 画 ----------
+    def _subtitle_seconds(self):
+        """当前**正在显示的那一帧**的媒体时刻（秒）。"""
+        if self.cap is None:
+            return 0.0
+        try:
+            position = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
+        except Exception:
+            return 0.0
+        fps = self.video_fps if self.video_fps > 0 else 30.0
+        # ⚠️ POS_FRAMES 读的是"下一帧的序号"，正在显示的是它减一。差的这一帧
+        # 就是 40ms，字幕会提前一点点冒出来 —— 单看根本看不出来，但既然顺手
+        # 能写对，就别给自己留一个"一帧的错位"。
+        return max(0.0, (position - 1) / fps)
+
+    def _subtitle_rows(self):
+        """这一帧要画的字幕行 `[(语种, 文字), ...]`；没有就返回 `[]`。"""
+        if not self.subtitle_enabled or self.subtitle_mode == "off":
+            return []
+        if self.cap is None or not self.subtitle_set.available:
+            return []
+        return self.subtitle_set.lines_for(self._subtitle_seconds(),
+                                           self.subtitle_mode)
+
+    def _compose_subtitles(self, image, video_box):
+        """把字幕贴到 `image`（已合成好的整屏，PIL RGBA）上。
+
+        `video_box` 是视频画面那块矩形 `(x, y, w, h)`：字幕贴着**它的**底部
+        居中，所以有黑边时不会飘进黑边里，全屏时又正好在最下面。
+
+        字号按视频显示高度算（全屏自动变大），并夹在 `SUBTITLE_FONT_SIZE_MIN/MAX`
+        之间 —— 窗口很小的时候按比例算出来只有几像素，看不清等于没有；
+        4K 全屏时不夹住又会糊脸。
+        """
+        rows = self._subtitle_rows()
+        if not rows:
+            return
+        _x, _y, box_w, box_h = video_box
+        if box_w < 40 or box_h < 40:
+            return                      # 画面小到没法放字幕，宁可不画
+        size = max(SUBTITLE_FONT_SIZE_MIN,
+                   min(SUBTITLE_FONT_SIZE_MAX,
+                       int(box_h * SUBTITLE_FONT_SIZE_RATIO)))
+        layer = self._subtitle_renderer.layer(
+            rows, size, int(box_w * SUBTITLE_WIDTH_RATIO))
+        if layer is None:
+            return
+        layer_w, layer_h = layer.size
+        paste_x = video_box[0] + (box_w - layer_w) // 2
+        paste_y = (video_box[1] + box_h - layer_h
+                   - max(SUBTITLE_BOTTOM_MARGIN_MIN,
+                         int(box_h * SUBTITLE_BOTTOM_MARGIN_RATIO)))
+        image.paste(layer, (paste_x, paste_y), layer)
 
     # ============================================================
     # 【第 17 轮·新】记忆播放位置
@@ -1778,6 +2052,11 @@ class VideoPlayerApp:
         # 渲染之前滑块还指着片头。
         self.seek_var.set(start_frame)
 
+        # 【第 18 轮·新】装配这个视频的字幕（自动找同名 .srt / .vtt）。
+        # ⚠️ 必须在 `update_frame()` 之前 —— 第一帧就要把字幕一起画上去，
+        #    放后面的话会看到"第一帧没字幕、第二帧才冒出来"，像卡了一下。
+        self._load_subtitles(file_path)
+
         self.update_frame()
 
         # 【第 14 轮·新】记进播放列表（放在"已经真的能播"之后 —— 打不开的文件
@@ -1788,10 +2067,19 @@ class VideoPlayerApp:
 
         # 【第 17 轮·新】续播时明确告诉用户"刚才那个选择生效了，从这儿开始"。
         # 不吭声的话，画面直接跳到中间会让人怀疑是播放器坏了。
+        #
+        # 【第 18 轮】状态行只有一条，两次 set 会互相覆盖（后写的赢），而"续播了"
+        # 和"上了字幕"都是用户该知道的事 —— 所以攒成一个列表拼起来写一次。
+        notices = []
         if start_sec > 0:
-            self._set_playlist_status("从 %s 继续播放：%s"
-                                      % (format_hms(start_sec),
-                                         os.path.basename(file_path) or file_path))
+            notices.append("从 %s 继续播放" % format_hms(start_sec))
+        if self.subtitle_set.available:
+            notices.append(self.subtitle_set.describe() if self.subtitle_font_path
+                           else "找到字幕但本机缺少中文字体")
+        if notices:
+            self._set_playlist_status(
+                "%s：%s" % (" · ".join(notices),
+                           os.path.basename(file_path) or file_path))
 
         # 【第 11 轮·修正 2】刚选完文件的用户，下一个动作几乎一定是播放/暂停。
         # 而此刻焦点还留在"打开视频"那个按钮上 —— 空格会被按钮吃掉（重新打开
@@ -2320,6 +2608,8 @@ class VideoPlayerApp:
             self.nudge_position(SHORTCUT_SEEK_STEP_SEC)
         elif key == "k":
             self.toggle_play()
+        elif key == "v":
+            self.cycle_subtitle_mode()
         else:
             return None
         return "break"
@@ -2415,8 +2705,15 @@ class VideoPlayerApp:
             "J  /  L       快退、快进 %.0f 秒\n"
             "↑  /  ↓       音量 +5%%、-5%%\n"
             "M             静音开关\n"
+            "V             切换字幕（关闭 → 中文 → 英文 → 中英双语）\n"
             "F  /  F11     全屏开关\n"
             "F1            显示这份说明\n\n"
+            "字幕（把 .srt / .vtt 放在视频旁边、与视频同名即可自动加载）：\n"
+            "· 认 `电影.srt`、`电影.zh.srt`、`电影.en.srt`、`电影.中英.srt` 这些写法，\n"
+            "  也认视频同目录下的 subs / 字幕 子目录；名字看不出语种就按内容判断\n"
+            "· 一个文件里中文一行、英文一行的（字幕组最常见的那种），选\n"
+            "  【中英双语】就是中文在上、英文在下两行一起显示\n"
+            "· 名字对不上号的（下载下来叫 1.srt 之类）点【载入字幕】手选\n\n"
             "播放列表（右侧那一栏）：\n"
             "· 可以直接把视频文件从资源管理器拖进窗口，拖进来就开始播\n"
             "· 双击列表条目播放它；播完自动播下一项（列表末尾回到第一项）\n"
@@ -2551,6 +2848,24 @@ class VideoPlayerApp:
             self._show_controls()
         self._schedule_hide_controls()
 
+    def _screenshot_frame(self):
+        """截图用的图像：**默认用"上一次真正上屏的那一屏"**。
+
+        【第 18 轮·改】原来是直接存 `current_frame_image`（`_process_3d` 的输出），
+        它只是"视频本身"，没有黑边、也没有字幕 —— 于是截出来的图跟屏幕上看到
+        的不是一回事：明明在看双语字幕，截图里一个字都没有。这属于"早晚会被当
+        bug 报上来"的差异，所以顺手让它所见即所得。
+
+        `_last_display_image` 是 `render_current_frame` 收尾时留下的整屏 RGBA。
+        极少数情况下它可能是空的（比如刚打开、一帧都还没渲染），那就退回旧行为。
+        """
+        image = self._last_display_image
+        if image is not None:
+            # PIL 是 RGBA（红绿蓝 + alpha），OpenCV 要 BGR。用花式索引取反序，
+            # 顺手把 alpha 丢掉；这一步会产出新数组（连续内存），imencode 收得下。
+            return np.asarray(image)[:, :, [2, 1, 0]]
+        return self.current_frame_image
+
     def save_screenshot(self):
         """把当前画面另存为图片。
 
@@ -2577,7 +2892,7 @@ class VideoPlayerApp:
             # 用 imencode + 二进制写文件，而不是 cv2.imwrite：
             # OpenCV 的 imwrite 走窄字节路径，在 Windows 上遇到中文/非 ASCII
             # 路径会直接失败（这正是"截图_20261013.jpg"这类默认名的常见坑）。
-            ok, buf = cv2.imencode(ext, self.current_frame_image)
+            ok, buf = cv2.imencode(ext, self._screenshot_frame())
             if not ok:
                 raise RuntimeError("图像编码失败")
             with open(save_path, "wb") as f:
