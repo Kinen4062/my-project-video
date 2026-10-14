@@ -94,7 +94,7 @@ def body(root, app, fp, s):
     app.toggle_play()                     # 暂停 —— 逐帧步进的主要用法
     pump(root, 0.4)
 
-    s.section("⓪ 绑定注册方式")
+    s.section("0 绑定注册方式")
     s.check(bool(root.bind_all("<Right>")) and bool(root.bind_all("<Key-m>")),
             "快捷键注册在 bind_all 上（焦点在子控件上时也能收到）")
     s.check(not root.bind("<Right>"),

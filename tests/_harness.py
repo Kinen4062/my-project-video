@@ -26,6 +26,9 @@
   退出码。
 - **量"音量"只认混音通道值**，不认 `get_volume()` —— 后者读的是不参与混音的
   `settings.audio_volume`，会撒谎（见 MEMORY 第 9 条）。
+- **输出统一 UTF-8**（模块导入时 `reconfigure`，见 `_force_utf8_streams`）：否则
+  重定向 / CI 下 Python 会按 gbk 编码 stdout，断言消息里的圈码 / 箭头 / emoji
+  直接把套件打死。另外断言消息**别再引入 gbk 编不出的字符** —— 中文 + ASCII 够用了。
 - 运行期产物一律落在 `%TEMP%/fp_tests/`，`run_tests.py` 收尾时清掉。
 """
 
@@ -37,6 +40,28 @@ import tempfile
 import time
 
 import cv2
+
+
+def _force_utf8_streams():
+    """把自己的 stdout/stderr 切到 UTF-8 —— **重定向时唯一能救命的动作**。
+
+    Python 发现 stdout 是文件/管道（重定向、CI 日志）就不用控制台那套，
+    而按系统 ANSI 代码页（简中 = gbk）编码。断言消息里那些圈码 / 箭头之类
+    字符 gbk 编不出来 → `UnicodeEncodeError` 直接把套件打死，退出码 1 ——
+    **看着像用例失败，其实一个字都没测**（实测复现）。
+
+    放在模块导入时执行：六个套件都 `from _harness import ...`，所以单跑
+    `python tests/test_xxx.py` 也一样安全。`errors="replace"` 兜底：真撞上
+    编不出的字符宁可打成 `?`，也不能让整轮回归陪葬。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+_force_utf8_streams()
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJ = os.path.dirname(HERE)
@@ -92,7 +117,7 @@ def city_fixture():
 def make_noaudio_fixture(dst, src=None, seconds=3.0):
     """造一个"**无音轨** + 左右分屏"的假 3D 产物，返回路径。
 
-    这正是本程序 `cv2.VideoWriter` 转换产物的形态（只写视频流 ⇒ 没有音轨）。
+    这正是本程序 `cv2.VideoWriter` 转换产物的形态（只写视频流 => 没有音轨）。
     必须专门测这一档，因为"无音轨"是下面这一整套兜底逻辑的唯一触发条件：
     死时钟检测、墙钟主时钟、永不调 `set_volume`（调了就踩 NULL 段错误）。
     第 9、10 轮那两个段错误全都是无声素材才暴露出来的。
