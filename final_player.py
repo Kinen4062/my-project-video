@@ -3,7 +3,6 @@ import sys       # 【P2】退出前冲刷输出缓冲
 import shutil  # 用于复制文件
 import tempfile  # 【P1】转换产物落到系统临时目录，不再污染工作目录
 import uuid      # 【P1】每次转换生成唯一临时文件名，避免互相覆盖
-import subprocess  # 【第 11 轮】调用 ffmpeg 把原音轨补回转换产物
 
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
@@ -18,6 +17,24 @@ import time
 import math
 from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 from ffpyplayer.player import MediaPlayer
+
+# ============================================================
+# 【第 12 轮·重构】本地模块
+# ------------------------------------------------------------
+# 从本文件搬走的都是"不读写 VideoPlayerApp 状态"的纯函数，各自成文件：
+#   media_tools —— ffmpeg 相关（判音轨 / 补音轨 / 删临时文件）
+#   depth3d     —— SBS 原始帧 → 当前显示模式的帧（含 remap 网格缓存）
+#   viewfit     —— 取景计算（min 缩放几何 + 四周模糊背景的缓存）
+# 本文件仍然保留同名薄封装方法（`_mux_audio_into_video` / `_process_3d` /
+# `_get_letterbox_bg`），所以**调用点一行都不用改**。
+# ============================================================
+import media_tools
+import depth3d
+import viewfit
+# 下面这个名字只是**再导出**：实现已经不在本文件里了，
+# 但测试套件引用 `final_player.has_audio_stream`，所以要留着。
+from media_tools import has_audio_stream   # noqa: F401  (re-export)
+
 # ============ 深色主题配色 ============
 DARK_BG      = "#1e1e1e"   # 主背景
 DARK_BG2     = "#2b2b2b"   # 次级背景（面板、进度条槽）
@@ -228,11 +245,9 @@ SILENT_CLOCK_MAX_LAG_SEC = 1.0
 # 所以小跨度丢帧一律用 grab；只有跨度大到 grab 反而不划算时才退回 set。
 FRAME_SYNC_MAX_GRAB = 60
 
-# 【P2 修复】render_current_frame 里最贵的一步是"四周那圈模糊背景"：
-# 要把整幅放大到 cover 尺寸、降采样、模糊、再放大回窗口大小。
-# 它只是变暗后的陪衬（alpha=0.45），画面变化极慢，没必要每帧重算。
-# 这里每 N 帧重算一次、其余帧复用缓存。
-BG_REFRESH_INTERVAL = 3
+# 【P2 修复】"四周那圈模糊背景每 N 帧重算一次"这条策略连同它的常量一起搬到了
+# `viewfit.py`（见 `viewfit.BG_REFRESH_INTERVAL` / `viewfit.LetterboxBgCache`）——
+# 它是纯取景计算，跟窗口控件无关。
 
 # 【P2 修复】全屏时"鼠标移动 → 显示底栏"的事件节流（毫秒）。
 # 不节流的话，鼠标每移动一个像素就会 after_cancel + after 一次。
@@ -258,10 +273,12 @@ CONVERSION_JOIN_TIMEOUT_SEC = 1.0
 #   （`.venv/share/ffpyplayer/ffmpeg/bin/ffmpeg.exe`），**不在 PATH 上**；
 #   而且只有 FULL-BUILD 轮子才带它，别的机器装了 ffpyplayer 未必有。
 #   ⇒ 找不到就**静默降级**为无声产物（转换本身绝不因此失败），只在控制台说明一句。
+#
+# 【第 12 轮·重构】mux 的实现与它的两个常量（超时 / 码率）搬去了
+# `media_tools.py`；**这里只留查找与缓存**。之所以不一起搬：下面这对全局变量
+# 是测试伪造"本机没有 ffmpeg"的唯一接缝（见 tests/test_audio_mux.py 第 ④ 节），
+# 留在原处那个接缝才继续有效 —— 搬走就得改测试，等于削弱防线。
 # ============================================================
-FFMPEG_MUX_TIMEOUT_SEC = 300      # 单次 mux 的超时；超时即放弃音轨（大文件也够）
-FFMPEG_AUDIO_BITRATE = "160k"     # 音轨重新编码成 aac 的码率（原轨可能是任意格式）
-
 _FFMPEG_PATH = None      # 缓存：""=找过但没有；其它=可执行文件路径
 _FFMPEG_SEARCHED = False
 
@@ -308,29 +325,8 @@ def find_ffmpeg():
     return None
 
 
-def has_audio_stream(ffmpeg, path):
-    """判断媒体文件里有没有音轨。
-
-    用 `ffmpeg -i` 的 stderr 里有没有 "Audio:" 字样来判断，**不依赖 ffprobe**
-    （ffpyplayer 那份 wheel 里只有 ffmpeg.exe，没有 ffprobe.exe）。
-    注意：`ffmpeg -i xxx` 不带输出参数时退出码就是 1，属正常，不能拿退出码判断。
-    """
-    try:
-        proc = subprocess.run([ffmpeg, "-hide_banner", "-i", path],
-                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                              timeout=60)
-    except Exception:
-        return False
-    return b"Audio:" in (proc.stderr or b"")
-
-
-def _remove_quietly(path):
-    """删文件，失败不抛异常（临时文件清理到处都要用）"""
-    try:
-        if path and os.path.exists(path):
-            os.remove(path)
-    except Exception:
-        pass
+# `has_audio_stream()` 与 `_remove_quietly()` 的实现已搬到 media_tools.py。
+# 前者仍在本模块出现 —— 那是**再导出**（见文件顶部的 import），测试套件要用。
 
 
 class PlayState:
@@ -405,9 +401,8 @@ class VideoPlayerApp:
         self.parallax_value = 0.0  # 视差偏移，正值增强 3D
         self.swap_eyes = False  # 是否交换左右眼
         self.current_raw_frame = None  # 保存未处理的 SBS 原始帧
-        self._mesh_hw = None  # remap 网格缓存
-        self._mesh_x = None
-        self._mesh_y = None
+        # remap 坐标网格的缓存，内部自己持有 x/y 与尺寸 —— 见 depth3d.MeshCache
+        self._mesh = depth3d.MeshCache()
 
         # --- 3D 显示模式变量 ---
         self.display_mode = "2D"
@@ -728,10 +723,9 @@ class VideoPlayerApp:
         # 容器尺寸，避免同一尺寸的重复 Configure 触发无谓的重绘。
         self._last_container_size = None
 
-        # 【P2 修复】模糊背景缓存（见 BG_REFRESH_INTERVAL）
-        self._bg_cache = None
-        self._bg_cache_size = None
-        self._bg_age = 0
+        # 【P2 修复】四周模糊背景的缓存（实现在 viewfit.LetterboxBgCache，
+        # "每 N 帧重算一次"的常量是 viewfit.BG_REFRESH_INTERVAL）
+        self._bg = viewfit.LetterboxBgCache()
 
     # ============================================================
     # 【P2 修复】播放状态的两个"视图"属性
@@ -815,11 +809,8 @@ class VideoPlayerApp:
 
         h, w = frame.shape[:2]
 
-        # 前景：min 缩放，完整显示
-        fg_scale = min(win_w / w, win_h / h)
-        fg_w = max(1, int(w * fg_scale))
-        fg_h = max(1, int(h * fg_scale))
-        interp = cv2.INTER_AREA if fg_scale < 1.0 else cv2.INTER_LINEAR
+        # 前景：min 缩放，完整显示（几何计算见 viewfit.fit_min）
+        fg_w, fg_h, interp = viewfit.fit_min(w, h, win_w, win_h)
         fg = cv2.resize(frame, (fg_w, fg_h), interpolation=interp)
 
         if fg_w == win_w and fg_h == win_h:
@@ -850,49 +841,14 @@ class VideoPlayerApp:
     def _get_letterbox_bg(self, frame, win_w, win_h):
         """生成"铺满整个窗口的模糊暗背景"（带缓存）。
 
-        【P2 修复】原来每渲染一帧就要：把整幅放大到 cover 尺寸（可能比窗口
-        还大）→ 降采样 → 高斯模糊 → 再放大回窗口大小 → 整体压暗。视频每帧
-        都在变，但这层背景是 0.45 倍压暗 + 强模糊的陪衬，肉眼几乎看不出
-        逐帧差异，所以按 BG_REFRESH_INTERVAL 帧重算一次、其余帧复用即可。
+        【第 12 轮·重构】计算与缓存都搬到了 `viewfit.LetterboxBgCache`
+        （纯 numpy/cv2，不碰控件）。这里保留同名方法只为让调用点不变，
+        缓存实例是 `self._bg`。
 
-        缓存以窗口尺寸为键：窗口一变立刻重算（否则会在旧尺寸的图上取错区域）。
-        返回的数组归缓存所有，调用方不要再往里写（需要写请先 copy）。
+        返回的数组归缓存所有，调用方不要再往里写（需要写请先 copy）——
+        `render_current_frame` 里就是 `.copy()` 出去的。
         """
-        size = (win_w, win_h)
-        if self._bg_cache_size != size:
-            self._bg_cache_size = size
-            self._bg_cache = None
-            self._bg_age = 0        # 尺寸变了：立刻重算
-
-        if self._bg_cache is None or self._bg_age >= BG_REFRESH_INTERVAL:
-            h, w = frame.shape[:2]
-            bg_scale = max(win_w / w, win_h / h)
-            bg_w = max(1, int(w * bg_scale))
-            bg_h = max(1, int(h * bg_scale))
-            bg = cv2.resize(frame, (bg_w, bg_h), interpolation=cv2.INTER_LINEAR)
-
-            # 居中裁剪到窗口大小
-            bx = max(0, (bg_w - win_w) // 2)
-            by = max(0, (bg_h - win_h) // 2)
-            bg = bg[by:by + win_h, bx:bx + win_w]
-
-            # 降采样模糊，提高性能
-            small_w = max(1, win_w // 8)
-            small_h = max(1, win_h // 8)
-            bg_small = cv2.resize(bg, (small_w, small_h), interpolation=cv2.INTER_AREA)
-            bg_small = cv2.GaussianBlur(bg_small, (0, 0), sigmaX=3, sigmaY=3)
-            bg = cv2.resize(bg_small, (win_w, win_h), interpolation=cv2.INTER_LINEAR)
-            bg = cv2.convertScaleAbs(bg, alpha=0.45, beta=0)
-
-            # 保证与窗口同尺寸（浮点舍入可能差 1 像素）
-            if bg.shape[0] != win_h or bg.shape[1] != win_w:
-                bg = cv2.resize(bg, (win_w, win_h), interpolation=cv2.INTER_LINEAR)
-            self._bg_cache = bg
-            self._bg_age = 0
-        else:
-            self._bg_age += 1
-
-        return self._bg_cache
+        return self._bg.get(frame, win_w, win_h)
 
     def open_video(self, file_path=None):
         if file_path is None:
@@ -1137,64 +1093,19 @@ class VideoPlayerApp:
     def _mux_audio_into_video(self, video_path, audio_source_path):
         """把 `audio_source_path` 的音轨并入 `video_path`（**原地替换**）。
 
-        【第 11 轮·新】`cv2.VideoWriter` 只写视频流，转换产物天生没有音轨
-        （症状："视频转成 3D 之后就没声音了"）。这里在转换收尾补一次音轨。
+        【第 12 轮·重构】实现搬到 `media_tools.mux_audio_into_video`（纯函数）。
+        这里保留同名薄封装，理由有二：
+          ① 调用点（`process_video_to_3d` 收尾）与测试都按这个名字调用，不动最安全；
+          ② **ffmpeg 的查找仍留在本文件** —— 这里靠 `find_ffmpeg()` 拿到路径再传进去，
+             于是测试改写 `_FFMPEG_PATH` 伪造"本机没有 ffmpeg"的接缝继续有效。
+             顺带还去掉一个隐性依赖：原来 mux 自己偷偷调 `find_ffmpeg()`，
+             "补音轨能不能跑"取决于一个它签名上看不见的全局状态。
 
-        返回 True = 音轨已并进去；返回 False = 没补（产物仍是可播放的无声文件）。
-        下面三种情况都走 False，且**一律不抛异常** —— 补音轨是锦上添花，
-        绝不能让它把整个转换搞失败：
-          ① 找不到 ffmpeg（多路径查找见模块级 `find_ffmpeg`）；
-          ② 源文件自己就没有音轨（没什么可补的）；
-          ③ ffmpeg 执行失败或超时。
-
-        实现要点：
-          - 视频流 `-c:v copy` 不重编码，只多花一两秒；
-          - 音轨统一重编码成 aac（原轨可能是任意格式/采样率，copy 进 mp4 未必合法）；
-          - `-shortest` 让音轨跟着视频长度收尾（音频比视频长时不会拖出静音尾巴）；
-          - 先写同目录临时文件再 `os.replace` 原子替换 —— 中途失败也不会毁掉
-            已经写好的无声产物。
+        返回 True = 音轨已并进去；False = 没补（产物仍是可播放的无声文件），
+        三种情况都**不抛异常**：找不到 ffmpeg / 源文件本来没音轨 / ffmpeg 失败或超时。
         """
-        ffmpeg = find_ffmpeg()
-        if ffmpeg is None:
-            print("未找到 ffmpeg，转换产物将不带音轨（视频本身不受影响）")
-            return False
-        if not has_audio_stream(ffmpeg, audio_source_path):
-            print("源视频没有音轨，无需补音轨")
-            return False
-
-        tmp_path = video_path + ".muxing.mp4"
-        cmd = [
-            ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-            "-i", video_path, "-i", audio_source_path,
-            "-map", "0:v:0", "-map", "1:a:0",
-            "-c:v", "copy",
-            "-c:a", "aac", "-b:a", FFMPEG_AUDIO_BITRATE,
-            "-shortest",
-            tmp_path,
-        ]
-        try:
-            proc = subprocess.run(cmd, stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE,
-                                  timeout=FFMPEG_MUX_TIMEOUT_SEC)
-        except Exception as e:
-            print(f"补音轨失败（ffmpeg 调用异常）: {e}")
-            _remove_quietly(tmp_path)
-            return False
-
-        if (proc.returncode != 0 or not os.path.exists(tmp_path)
-                or os.path.getsize(tmp_path) == 0):
-            detail = (proc.stderr or b"").decode("utf-8", "replace").strip()
-            print(f"补音轨失败（ffmpeg 退出码 {proc.returncode}）: {detail[-400:]}")
-            _remove_quietly(tmp_path)
-            return False
-
-        try:
-            os.replace(tmp_path, video_path)
-        except Exception as e:
-            print(f"补音轨失败（替换产物出错）: {e}")
-            _remove_quietly(tmp_path)
-            return False
-        return True
+        return media_tools.mux_audio_into_video(
+            video_path, audio_source_path, find_ffmpeg())
 
     def _update_conversion_progress(self, current, total, start_time):
         """在主线程更新进度条和文字"""
@@ -2919,79 +2830,18 @@ class VideoPlayerApp:
         self.btn_mute.config(text="🔇" if self.audio_muted else "🔊")
         self._apply_volume_now()
 
-    def _get_mesh(self, h, w):
-        """缓存 remap 用的坐标网格，避免每帧重建"""
-        if self._mesh_hw != (h, w):
-            x = np.arange(w, dtype=np.float32)
-            y = np.arange(h, dtype=np.float32)
-            self._mesh_x, self._mesh_y = np.meshgrid(x, y)
-            self._mesh_hw = (h, w)
-        return self._mesh_x, self._mesh_y
-
     def _process_3d(self, frame):
-        """把 SBS 原始帧处理成当前显示模式的帧"""
-        if self.display_mode == "2D":
-            return frame
+        """把 SBS 原始帧处理成当前显示模式的帧。
 
-        h, w = frame.shape[:2]
-        w_half = w // 2
-        if w_half <= 0:
-            return frame
+        【第 12 轮·重构】实现搬到 `depth3d.process_3d`（纯函数）；原来它专用的
+        `_get_mesh` 也随之变成 `depth3d.MeshCache`（实例是 `self._mesh`）——
+        `_mesh_hw` / `_mesh_x` / `_mesh_y` 三个字段因此从本类消失。
 
-        # 【P2 修复】原来这里无条件做两次 cv2.resize(left/right_eye, (w_half, h))：
-        #   - w 为偶数时（绝大多数情况）切片宽度正好就是 w_half，
-        #     目标尺寸与源尺寸完全相同 → 纯空操作，每帧白做两次全画幅拷贝；
-        #   - w 为奇数时右眼比左眼宽 1 像素，这时才真的需要裁到同一宽度。
-        # 所以改成"只在宽度不一致时才 resize"。另外切片本身是**非连续视图**
-        # （行跨距还是整幅宽度），统一用 ascontiguousarray 交一份连续内存给
-        # 后面的 cv2.split / cv2.remap，避免它们内部再偷偷转换。
-        left_eye = frame[:, 0:w_half]
-        right_eye = frame[:, w_half:w]
-        left_eye = (cv2.resize(left_eye, (w_half, h)) if left_eye.shape[1] != w_half
-                    else np.ascontiguousarray(left_eye))
-        right_eye = (cv2.resize(right_eye, (w_half, h)) if right_eye.shape[1] != w_half
-                     else np.ascontiguousarray(right_eye))
-
-        # 【新增】交换左右眼
-        if self.swap_eyes:
-            left_eye, right_eye = right_eye, left_eye
-
-        # 【新增】实时视差调节
-        extra = self.parallax_value
-        if extra != 0:
-            x_base, y_base = self._get_mesh(h, w_half)
-            left_eye = cv2.remap(left_eye, x_base + extra, y_base,
-                                 cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-            right_eye = cv2.remap(right_eye, x_base - extra, y_base,
-                                  cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-
-        # 3D 合成（逻辑与原代码一致）
-        if self.display_mode == "红蓝3D":
-            b_l, g_l, r_l = cv2.split(left_eye)
-            b_r, g_r, r_r = cv2.split(right_eye)
-            return cv2.merge((b_l, g_l, r_r))
-
-        elif self.display_mode == "偏振-隔行":
-            combined = np.zeros_like(left_eye)
-            combined[0::2, :] = left_eye[0::2, :]
-            combined[1::2, :] = right_eye[1::2, :]
-            return combined
-
-        elif self.display_mode == "偏振-隔列":
-            combined = np.zeros_like(left_eye)
-            combined[:, 0::2] = left_eye[:, 0::2]
-            combined[:, 1::2] = right_eye[:, 1::2]
-            return combined
-
-        elif self.display_mode == "偏振-棋盘":
-            combined = np.zeros_like(left_eye)
-            combined[0::2, 0::2] = left_eye[0::2, 0::2]
-            combined[0::2, 1::2] = right_eye[0::2, 1::2]
-            combined[1::2, 0::2] = right_eye[1::2, 0::2]
-            combined[1::2, 1::2] = left_eye[1::2, 1::2]
-            return combined
-
-        return frame
+        保留同名薄封装，三个调用点（update_frame / change_display_mode /
+        _refresh_paused_frame）就一行都不用改。
+        """
+        return depth3d.process_3d(frame, self.display_mode, self.swap_eyes,
+                                  self.parallax_value, self._mesh)
 
     def _refresh_paused_frame(self):
         """暂停状态下按当前设置重算并重绘一帧。
