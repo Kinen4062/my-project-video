@@ -15,6 +15,7 @@ from PIL import Image, ImageTk
 import threading
 import time
 import math
+import datetime    # 【第 20 轮】把配额的 UTC 重置时刻换成本地时钟（见 _format_quota_reset）
 import queue      # 【第 20 轮】后台线程 → 主线程的唯一安全通道（见 _poll_online）
 from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 from ffpyplayer.player import MediaPlayer
@@ -390,6 +391,44 @@ SUBTITLE_BAR_FONT_MAX = 40
 # 80ms 是"手感"和"开销"的折中 —— 匹配本身要好几秒，轮询再密也只是白烧 CPU，
 # 再疏就会让"匹配完成"明显滞后于实际完成。
 ONLINE_POLL_INTERVAL_MS = 80
+
+
+def _format_quota_reset(value):
+    """把接口给的 UTC 重置时刻转成**本地时钟**，返回 `"HH:MM"`；读不出来返回 `""`。
+
+    为什么非转不可：官方按 **UTC 午夜** 重置下载配额 —— 真机验证拿到的原话是
+    `reset_time_utc = 2026-10-14T23:59:59.999Z`。对 UTC+8 的用户来说那是
+    **第二天早上 8 点**，所以直接说「今天还剩 N 次」等于告诉用户一个错误的
+    重置时刻：早上 7 点看到「0 次」，9 点又冒出「5 次」，像是额度乱跳。
+    改成「还剩 N 次（08:00 重置）」之后，"还剩几次"和"什么时候恢复"就都对得上了。
+
+    ⚠️ 只用标准库。**别引第三方库来解析时间**，也别假设输入一定是 ISO ——
+    真机上见过尾部是 `...Z`，测试里为了让格式容错用的是空格分隔。所以这里
+    两种都试，全失败就返回空串（宁可少说一句，也不能因为一句话让匹配结果报错）。
+    """
+    if not value:
+        return ""
+    text = str(value).strip()
+    moment = None
+    try:
+        moment = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception:
+        for pattern in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S",
+                        "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                moment = datetime.datetime.strptime(text, pattern)
+                break
+            except Exception:
+                continue
+    if moment is None:
+        return ""
+    if moment.tzinfo is None:
+        # 没有时区信息的当成 UTC —— 接口给的就是 UTC，它只是不总是带后缀。
+        moment = moment.replace(tzinfo=datetime.timezone.utc)
+    try:
+        return moment.astimezone().strftime("%H:%M")
+    except Exception:
+        return ""
 
 # ============================================================
 # 【第 11 轮·新】转换产物补回音轨
@@ -2007,8 +2046,15 @@ class VideoPlayerApp:
         notes = ["已匹配 %s" % result["description"]]
         remaining = result["meta"].get("remaining")
         if remaining is not None:
-            # 官方只在下载那一刻告诉你还剩几次，所以这里一定要露给用户看
-            notes.append("今天还剩 %s 次" % remaining)
+            # 官方只在下载那一刻告诉你还剩几次，所以这里一定要露给用户看。
+            # 顺带把**重置时刻**说清楚：配额按 UTC 午夜重置，对 UTC+8 的用户
+            # 那是早上 8 点 —— 只说「今天还剩 N 次」会让人以为过了 0 点就恢复
+            # （见 _format_quota_reset）。
+            clock = _format_quota_reset(result["meta"].get("reset_time_utc"))
+            if clock:
+                notes.append("还剩 %s 次（%s 重置）" % (remaining, clock))
+            else:
+                notes.append("今天还剩 %s 次" % remaining)
         notes.append("存到 %s" % os.path.basename(result["path"]))
         self._set_playlist_status(" · ".join(notes))
 

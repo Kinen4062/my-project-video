@@ -472,6 +472,42 @@ def section_save(s):
     s.check(sub.language_from_name(named_zh) == "zh",
             "让路加序号之后语种仍然认得出（%s）" % os.path.basename(named_zh))
 
+    # ---- 跨模块契约（第 20 轮真机验证补的）：「下完立刻生效」与「重开仍然生效」 ----
+    #
+    # `_online_done` 用 explicit_path 装刚下回来的那份，所以**当次**一定生效。
+    # 要防的是**下一次**打开视频：那时没人给 explicit_path，只剩 discover() 自动找。
+    # 若让路产生的名字排在原名**后面**，用户就会看到"我刚下的字幕，重开一次就变回
+    # 老的了" —— 比不生效更莫名其妙。
+    #
+    # 现在两者一致，靠的是 discover 排序键最后那一条"按名字定序"：
+    # `Movie.zh.1.srt` < `Movie.zh.srt`（第 9 位 `'1'`(0x31) < `'s'`(0x73)）。
+    # ⚠️ **这是 ASCII 顺序凑出来的，不是有人设计过** —— 所以在这儿钉一颗钉子：哪天
+    # 有人改了 `target_path` 的让路写法（比如换成 `Movie.zh(1).srt`），这条断言会
+    # 立刻红给他看，而不是等哪个用户来报"我的字幕莫名其妙变回去了"。
+    collide = _fresh("contract_order")
+    collide_video = os.path.join(collide, "Movie.mkv")
+    with open(collide_video, "wb") as fh:
+        fh.write(b"x" * 500)
+    mine = os.path.join(collide, "Movie.zh.srt")
+    with open(mine, "w", encoding="utf-8") as fh:
+        fh.write("1\n00:00:01,000 --> 00:00:03,000\n用户原来那份\n")
+    later = so.target_path(collide_video, "zh-cn")
+    s.check(os.path.basename(later) == "Movie.zh.1.srt",
+            "用户已有 .zh.srt → 在线那份落成 .zh.1.srt（%s）"
+            % os.path.basename(later))
+    with open(later, "w", encoding="utf-8") as fh:
+        fh.write("1\n00:00:01,000 --> 00:00:03,000\n刚下回来的那份\n")
+
+    order = [os.path.basename(p) for p, _ in sub.discover(collide_video)]
+    print("      discover 认领顺序：%s" % order)
+    bundle = sub.build(video_path=collide_video)
+    chosen = bundle.track_for("zh")
+    s.check(chosen is not None
+            and os.path.basename(chosen.path) == os.path.basename(later),
+            "重开视频时生效的仍是**刚下回来的那份**（%s）—— 与 _online_done 的 "
+            "explicit_path 一致；代价是用户原来那份不再自动生效（要它回来得删掉新"
+            "下的、或点【载入字幕】点名）" % os.path.basename(later))
+
     # ---- 内容写进去、并且转成 UTF-8 ----
     gbk_text = "1\r\n00:00:01,000 --> 00:00:03,000\r\n你好\r\n"
     target = os.path.join(folder, "gbk.zh.srt")
@@ -947,6 +983,51 @@ def section_ui(s):
 
 # ============================================================
 
+def section_quota_clock(s):
+    """【真机验证补的】配额重置时刻必须说成**本地**时间。
+
+    真机拿到的是 `reset_time_utc = 2026-10-14T23:59:59.999Z` —— UTC 午夜。
+    对 UTC+8 的用户来说那是**第二天早上 8 点**，所以状态行里"今天还剩 N 次"
+    是错的（早上 7 点看到 0 次、9 点又冒出 5 次，像额度在乱跳）。
+    改成「还剩 N 次（08:00 重置）」之后两个信息才都对得上。
+    """
+    s.section("⑪b 配额重置时刻要说成本地时钟（真机验证补的）")
+    import datetime as _dt
+
+    import final_player as fp
+
+    # ⚠️ 断言**不能写死** "08:00" —— 那只有 UTC+8 的机器能过。这里的做法是
+    #    在测试里独立算一遍"这个 UTC 时刻在本地是几点"，再跟函数比。
+    utc = _dt.datetime(2026, 10, 14, 23, 59, 59, 999000,
+                       tzinfo=_dt.timezone.utc)
+    local = utc.astimezone()
+    got = fp._format_quota_reset("2026-10-14T23:59:59.999Z")
+    s.check(got == local.strftime("%H:%M"),
+            "真机那种 Z 结尾的 UTC 时刻被转成本地时钟（%r -> %r，本机 %s）"
+            % ("2026-10-14T23:59:59.999Z", got, local.strftime("%z")))
+
+    offset = local.utcoffset()
+    if offset is not None and offset.total_seconds() != 0:
+        s.check(got != "23:59",
+                "本机不在 UTC 时区，显示的**不再是 UTC 的 23:59**"
+                "（本机偏移 %s，显示 %s）—— 这正是要修的那件事" % (offset, got))
+    else:
+        s.check(got == "23:59", "本机就在 UTC 时区（显示 %s）" % got)
+
+    s.check(fp._format_quota_reset(None) == "",
+            "没有这个字段 → 空串（退回原来那句「今天还剩 N 次」，不硬编）")
+    s.check(fp._format_quota_reset("") == "", "空串 → 空串")
+    s.check(fp._format_quota_reset("   ") == "", "只有空格 → 空串")
+    s.check(fp._format_quota_reset("不是时间") == "",
+            "垃圾输入 → 空串（绝不能因为一句话让匹配结果整体报错）")
+    s.check(fp._format_quota_reset("2026-10-15 00:00:00") != "",
+            "空格分隔的写法也认（%r）"
+            % fp._format_quota_reset("2026-10-15 00:00:00"))
+    s.check(fp._format_quota_reset("2026-10-15 00:00:00")
+            == fp._format_quota_reset("2026-10-15T00:00:00+00:00"),
+            "不带时区后缀的按 UTC 处理（跟显式 +00:00 同一结果）")
+
+
 def main():
     summary = Summary("在线字幕匹配（第 20 轮）")
     section_filenames(summary)
@@ -960,6 +1041,7 @@ def main():
     section_fetch(summary)
     section_offline(summary)
     section_ui(summary)
+    section_quota_clock(summary)
     return summary.finish()
 
 
