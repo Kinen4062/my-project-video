@@ -112,9 +112,16 @@ PLIST_MIN_WIDTH = 236
 # 下面每条都实测定过，不是照抄 Tk 文档推断的。
 
 _ARROW_KEYS = ("left", "right", "up", "down")
-# 【第 18 轮】多了 "v"（切换字幕模式）。加字母键只影响"让路矩阵"里那张
-# 输入框的清单（输入框本来就该吃掉所有字母键），所以规则表一行都不用改。
-_ALL_SHORTCUT_KEYS = _ARROW_KEYS + ("space", "m", "f", "j", "k", "l", "v")
+# 【第 18 轮】多了 "v"（切换字幕模式）。
+# 【第 19 轮】多了 "b"（开关独立字幕栏）。
+# 加字母键只影响"让路矩阵"里那张输入框的清单（输入框本来就该吃掉所有字母键），
+# 所以规则表一行都不用改。
+#
+# ⚠️ 这张表**必须**与 `_bind_global_shortcuts` 里真正绑定的序列一致 ——
+# 第 19 轮把它改成了"照着这张表生成绑定"，就是为了堵住第 18 轮那个坑：
+# 当时表里有 "v"、`_on_key_shortcut` 里也实现了 "v"，但绑定清单是手写的、
+# 漏掉了 `<Key-v>`，于是**测试全绿、真机上 V 键完全没反应**。
+_ALL_SHORTCUT_KEYS = _ARROW_KEYS + ("space", "m", "f", "j", "k", "l", "v", "b")
 
 # 真正"要打字"的控件：空格打空格、方向键移光标、字母变输入内容 → 全让。
 TEXT_INPUT_WIDGETS = (tk.Entry, ttk.Entry, tk.Text)
@@ -350,6 +357,29 @@ SUBTITLE_FONT_SIZE_MAX = 64       # 4K 全屏时别涨到糊脸
 SUBTITLE_WIDTH_RATIO = 0.92       # 一行字幕最多占视频宽度的比例，超了就折行
 SUBTITLE_BOTTOM_MARGIN_RATIO = 0.05   # 距视频画面底部留多少（按视频显示高度算）
 SUBTITLE_BOTTOM_MARGIN_MIN = 4
+
+# 【第 19 轮·新】独立字幕栏 —— 把字幕挪到画面之外的一条横条里。
+#
+# 起因：字幕画在画面内底部会遮住画面下缘一条。2D 看片时这是所有播放器的标准
+# 形态、用户也熟，但**3D 模式的价值就是沉浸感**，遮挡在那里最扎眼。
+#
+# 为什么不做"放进黑边里"：黑边只在"窗口宽高比 ≠ 视频宽高比"时才存在 ——
+# 全屏看 16:9 片子装在 16:9 显示器上时画面刚好铺满，黑边是 0 像素，字幕无处可放，
+# 只能再退回画面内。那种方案是"有时候行"，还要写一套 fallback。
+# 从窗口底部**切**一条出来则永远有效：代价写死在明面上（画面小一点），
+# 换来"字幕与画面彻底互不干扰"。
+#
+# 默认关闭（`subtitle_bar = False`）：不改变任何人已经习惯的形态。
+SUBTITLE_BAR_RATIO = 0.14          # 字幕栏高度 = 窗口高度 × 这个比例
+SUBTITLE_BAR_MIN = 48              # 再矮就放不下"中文一行 + 英文一行"
+SUBTITLE_BAR_MAX = 150             # 别把画面吃掉一大块
+SUBTITLE_BAR_MIN_WINDOW_H = 260    # 窗口比这还矮就干脆不启用（画面会被压得没法看）
+# ⚠️ 这是 **BGR**：它被写进还没 `cvtColor` 的 canvas（见 render_current_frame）。
+# 换颜色时别忘了通道顺序反着看，否则想要深蓝会得到深红。
+SUBTITLE_BAR_COLOR_BGR = (12, 12, 12)
+SUBTITLE_BAR_FONT_RATIO = 0.30     # 栏里的字号按**栏高**算（栏是固定高度的一条）
+SUBTITLE_BAR_FONT_MIN = 13
+SUBTITLE_BAR_FONT_MAX = 40
 
 # ============================================================
 # 【第 11 轮·新】转换产物补回音轨
@@ -739,16 +769,23 @@ class VideoPlayerApp:
             `subtitle.find_font` 的说明，找不到就静默不画，绝不因此崩）。
           · `_last_display_image` —— 上一次真正上屏的那一屏（PIL 图，含字幕与黑边），
             截图用它做"所见即所得"。
+          · `subtitle_bar` —— 【第 19 轮】独立字幕栏开关。开着时从窗口底部切出一条
+            纯色横条专门放字幕，字幕因此**永不遮画面**（3D 看片时尤其需要）；
+            代价是画面为了腾地方缩小一点。**默认关**：画在画面内底部是所有播放器
+            的标准形态，不该被悄悄改掉。换文件不重置（和 `subtitle_mode` 一样，
+            它是"我怎么看片"的偏好，不是"这个视频"的属性）。
         """
         self.subtitle_enabled = True
         self.subtitle_auto = True
         self.subtitle_mode = SUBTITLE_DEFAULT_MODE
+        self.subtitle_bar = False
         self.subtitle_set = subtitle.SubtitleSet()
         self.subtitle_font_path = subtitle.find_font()
         self._subtitle_renderer = subtitle.SubtitleRenderer(self.subtitle_font_path)
         self._last_display_image = None
         self.subtitle_var = tk.StringVar(
             value=SUBTITLE_MODE_LABELS[SUBTITLE_DEFAULT_MODE])
+        self.subtitle_bar_var = tk.BooleanVar(value=False)
 
     def _build_video_area(self):
         """顶层 grid 布局 + 视频显示区（video_container / video_label）。
@@ -943,6 +980,18 @@ class VideoPlayerApp:
         # 靠它救。自动找同名字幕是主路径，这个是兜底。
         tk.Button(self.aux_frame, text="载入字幕",
                   command=self.load_subtitle_file, **BTN_NORMAL).pack(side=tk.LEFT, padx=5)
+
+        # 【第 19 轮·新】字幕栏开关（也可按 B 键）。勾上之后从窗口底部切出一条
+        # 纯色横条专放字幕，字幕就**不再遮画面**了 —— 看 3D 时尤其有用。
+        # 放在【载入字幕】右边：它跟"字幕模式"是一组（都只管字幕怎么显示）。
+        self.subtitle_bar_check = tk.Checkbutton(
+            self.aux_frame, text="字幕栏", variable=self.subtitle_bar_var,
+            command=self.on_subtitle_bar_toggle,
+            bg=DARK_BG, fg=DARK_FG, selectcolor=DARK_BG3,
+            activebackground=DARK_BG, activeforeground=DARK_FG,
+            highlightthickness=0, bd=0,
+        )
+        self.subtitle_bar_check.pack(side=tk.LEFT, padx=(10, 0))
 
         # --- 视差与左右眼控制栏（仅 3D 模式有意义，见 _sync_parallax_visibility）---
         self.parallax_frame = tk.Frame(self.root, bg=DARK_BG)
@@ -1305,9 +1354,20 @@ class VideoPlayerApp:
         # 【第 11 轮·新】键盘快捷键。原来只有空格（播放/暂停）和 F11（全屏），
         # 连最基本的"逐帧看"、"调音量"都得去摸鼠标。这里逐个 keysym 绑到同一个
         # 入口：一是好维护，二是"焦点冲突"只需要在一处判断（见 _on_key_shortcut）。
-        for seq in ("<Left>", "<Right>", "<Up>", "<Down>",
-                    "<Key-m>", "<Key-f>", "<Key-j>", "<Key-k>", "<Key-l>"):
-            self.root.bind_all(seq, self._on_key_shortcut)
+        #
+        # 【第 19 轮·修复】这张清单原来是一个**手写的元组**，第 18 轮加了 V 键却
+        # 忘了往这里补 `<Key-v>` —— 后果是"V 切换字幕"在真机上完全没反应，而测试
+        # 却一直是绿的（它直接调 `_on_key_shortcut`，绕过了 Tk 的真实绑定）。
+        # 现在改成**照着 `_ALL_SHORTCUT_KEYS` 生成**：在表里 == 真的绑上了，
+        # 想让某个键失联就必须显式删掉它，不可能再悄悄漏一个。
+        # （测试 tests/test_subtitles.py 第 ⑩ 节会挨个检查 binding 是否存在。）
+        _KEY_SEQUENCES = {"left": "<Left>", "right": "<Right>",
+                          "up": "<Up>", "down": "<Down>"}
+        for _key in _ALL_SHORTCUT_KEYS:
+            if _key == "space":
+                continue      # 空格单独绑（要跟按钮的类绑定配合），见上面
+            self.root.bind_all(_KEY_SEQUENCES.get(_key, "<Key-%s>" % _key),
+                               self._on_key_shortcut)
         self.root.bind_all("<F1>", self.show_shortcuts)
 
         # 【第 11 轮·修正 2】窗口重新拿到焦点时兜一道底。
@@ -1527,25 +1587,24 @@ class VideoPlayerApp:
             return
 
         # 读取 video_container 的实际尺寸（它由 grid 第 0 行决定）
-        win_w = self.video_container.winfo_width()
-        win_h = self.video_container.winfo_height()
-        if win_w <= 1 or win_h <= 1:
-            win_w = self.video_label.winfo_width()
-            win_h = self.video_label.winfo_height()
-        if win_w <= 1 or win_h <= 1:
-            win_w = self.root.winfo_width()
-            win_h = self.root.winfo_height() - 100
-        if win_w <= 1 or win_h <= 1:
-            win_w, win_h = 850, 520
+        win_w, win_h = self._video_area_size()
+
+        # 【第 19 轮·新】独立字幕栏：从窗口**底部**切一条出去，画面只在上面那块
+        # 里取景。`bar_h == 0`（默认）时下面每一句都和以前一模一样。
+        # 注意栏高只取决于"有没有字幕集 / 开关 / 窗口高度"，**不取决于这一秒有没有
+        # 字幕在显示** —— 否则播放中会出现"栏一会有一会没有"，画面跟着一抽一抽，
+        # 那比遮挡难看得多。
+        bar_h = self._subtitle_bar_height(win_h)
+        avail_h = win_h - bar_h
 
         h, w = frame.shape[:2]
 
         # 前景：min 缩放，完整显示（几何计算见 viewfit.fit_min）
-        fg_w, fg_h, interp = viewfit.fit_min(w, h, win_w, win_h)
+        fg_w, fg_h, interp = viewfit.fit_min(w, h, win_w, avail_h)
         fg = cv2.resize(frame, (fg_w, fg_h), interpolation=interp)
 
         if fg_w == win_w and fg_h == win_h:
-            # 刚好铺满，直接用
+            # 刚好铺满，直接用（有字幕栏时 fg_h == avail_h < win_h，走不到这里）
             canvas = fg
             # 【第 18 轮】字幕要贴着"视频画面那块矩形"底部，所以这里得记住它。
             video_box = (0, 0, fg_w, fg_h)
@@ -1561,11 +1620,21 @@ class VideoPlayerApp:
                 # 当前帧的前景烙进背景里，下一次复用就露出上一帧的影子。
                 canvas = self._get_letterbox_bg(frame, win_w, win_h).copy()
 
-            # 把前景居中贴上去
+            # 把前景居中贴上去（居中是在**可用区**里居中，不是整个窗口）
             x0 = (win_w - fg_w) // 2
-            y0 = (win_h - fg_h) // 2
+            y0 = (avail_h - fg_h) // 2
             canvas[y0:y0 + fg_h, x0:x0 + fg_w] = fg
             video_box = (x0, y0, fg_w, fg_h)
+
+        if bar_h:
+            # 字幕栏是一条**纯色**横条（不是模糊背景）—— 必须让人一眼看出它
+            # 在画面之外，否则用户会以为字幕还是画在画面里。
+            canvas[win_h - bar_h:win_h, :, :] = SUBTITLE_BAR_COLOR_BGR
+            subtitle_box = (0, win_h - bar_h, win_w, bar_h)
+            subtitle_placement = "bar"
+        else:
+            subtitle_box = video_box
+            subtitle_placement = "overlay"
 
         cv2image = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGBA)
         image = Image.fromarray(cv2image)
@@ -1577,13 +1646,62 @@ class VideoPlayerApp:
         # 而且它拿到的是 `video_box`（视频真正占的那块矩形），字幕因此贴着视频
         # 底部而不是窗口底部 —— 有黑边时才不会飘到黑边里去。
         # 没有字幕时这个方法第一句就返回，开销为零（老套件的耗时不变量靠它）。
-        self._compose_subtitles(image, video_box)
+        #
+        # 【第 19 轮】多了一个落点：`subtitle_box` 在"字幕栏"开着时是窗口底部
+        # 那条横条（画面之外），否则就是 `video_box` 本身（画面之内）。
+        self._compose_subtitles(image, subtitle_box, placement=subtitle_placement)
         # 截图要"所见即所得"，所以把真正上屏的这一屏留一份
         self._last_display_image = image
 
         imgtk = ImageTk.PhotoImage(image=image)
         self.video_label.imgtk = imgtk
         self.video_label.config(image=imgtk)
+
+    def _video_area_size(self):
+        """视频显示区的实际像素尺寸 `(w, h)`。
+
+        拿不到就逐级退回（容器 → 标签 → 主窗口 → 兜底值）—— 这套顺序原来写在
+        `render_current_frame` 里，第 19 轮抽出来是因为"字幕栏要不要启用"也得问
+        同一个尺寸。两处各写一份迟早会不一致，而那种不一致的表现是**状态行说
+        "字幕栏"、画面上却没有栏**。
+        """
+        win_w = self.video_container.winfo_width()
+        win_h = self.video_container.winfo_height()
+        if win_w <= 1 or win_h <= 1:
+            win_w = self.video_label.winfo_width()
+            win_h = self.video_label.winfo_height()
+        if win_w <= 1 or win_h <= 1:
+            win_w = self.root.winfo_width()
+            win_h = self.root.winfo_height() - 100
+        if win_w <= 1 or win_h <= 1:
+            win_w, win_h = 850, 520
+        return win_w, win_h
+
+    def _subtitle_bar_height(self, win_h):
+        """字幕栏该占多少像素；**0 = 不启用**（退回"画在画面内"）。
+
+        五个条件一个不满足就不切栏，每条都有明确理由：
+          · 开关没开          → 默认行为不变；
+          · 总开关关 / 模式=关闭 → 不画字幕要栏干什么；
+          · 没有字幕集        → 切出来是条空横条，白让画面变小；
+          · 找不到中文字体    → 反正一个字都画不出来（见 subtitle.find_font）；
+          · 窗口太矮          → 切掉 14% 之后画面已经没法看了，宁可不切。
+
+        ⚠️ 这里**故意不看"当前这一秒有没有 cue"**：字幕之间有空档（一句说完、
+        下一句还没到），如果按 cue 判断，栏会在播放中一闪一闪、画面跟着一抽一抽。
+        """
+        if not self.subtitle_bar:
+            return 0
+        if not self.subtitle_enabled or self.subtitle_mode == "off":
+            return 0
+        if not self.subtitle_set.available:
+            return 0
+        if not self.subtitle_font_path:
+            return 0
+        if win_h < SUBTITLE_BAR_MIN_WINDOW_H:
+            return 0
+        return max(SUBTITLE_BAR_MIN,
+                   min(SUBTITLE_BAR_MAX, int(win_h * SUBTITLE_BAR_RATIO)))
 
     def _get_letterbox_bg(self, frame, win_w, win_h):
         """生成"铺满整个窗口的模糊暗背景"（带缓存）。
@@ -1675,6 +1793,12 @@ class VideoPlayerApp:
                 SUBTITLE_MODE_LABELS.get(self.subtitle_mode, "关闭"))
         except Exception:
             pass
+        # 勾选框也跟着状态走：测试可以直接改 `subtitle_bar` 而不去点控件，
+        # 两边若不一致，界面上会显示"没勾"但字幕其实在栏里。
+        try:
+            self.subtitle_bar_var.set(bool(self.subtitle_bar))
+        except Exception:
+            pass
 
     def _subtitle_status_text(self):
         """状态行要说的那一句话。"""
@@ -1685,8 +1809,16 @@ class VideoPlayerApp:
             # 找不到字体时不画字幕（见 subtitle.find_font）。但**不能一声不吭**：
             # 用户会觉得"字幕没生效"，而真相是这台机器缺字体。说清楚。
             return "找到字幕了，但本机没有可用的中文字体，画不出来"
-        return "%s · %s" % (SUBTITLE_MODE_LABELS[self.subtitle_mode],
+        text = "%s · %s" % (SUBTITLE_MODE_LABELS[self.subtitle_mode],
                             self.subtitle_set.describe())
+        if self.subtitle_bar and self.subtitle_mode != "off":
+            # 勾了字幕栏就说清楚它到底生效没有 —— 窗口太矮时不切栏是刻意的，
+            # 但用户只看到"勾了却没栏"，会以为开关坏了。
+            if self._subtitle_bar_height(self._video_area_size()[1]):
+                text += " · 字幕栏"
+            else:
+                text += " · 字幕栏未启用（窗口太矮，先画在画面内）"
+        return text
 
     def on_subtitle_mode_change(self, event=None):
         """下拉框选了新模式。"""
@@ -1710,6 +1842,31 @@ class VideoPlayerApp:
         self._sync_subtitle_ui()
         self.render_current_frame()
         self._set_playlist_status(self._subtitle_status_text())
+
+    def on_subtitle_bar_toggle(self):
+        """【第 19 轮·新】勾选框回调：独立字幕栏开关。
+
+        只改"画在哪"，不改字号也不改内容 —— 所以开关前后画面上的差别只有两处：
+        字幕的位置，和画面为了腾地方缩小了一点（每帧都要重排几何，不只是一次）。
+
+        **必须主动重绘**：字幕栏不占 Tk 布局（它是画进画面里的），所以不会有
+        `<Configure>` 事件来替我们触发重画 —— 少了这一句就是"勾了没反应"。
+        """
+        self.subtitle_bar = bool(self.subtitle_bar_var.get())
+        self.render_current_frame()
+        self._set_playlist_status(self._subtitle_status_text())
+        # 勾选框被点过之后焦点留在它身上，空格就会去拨这个勾选框而不是播放/暂停
+        # —— 跟"选完下拉框"同款毛病，同样主动把焦点交回画面。
+        self._restore_shortcut_focus()
+
+    def toggle_subtitle_bar(self):
+        """B 键：开关字幕栏（与勾选框完全同一个动作）。
+
+        状态的实际归属仍是 `subtitle_bar`，这里只是**改一下控件变量**再走同一条
+        回调 —— 不另写一份逻辑，就不会出现"按键与勾选框行为不一致"。
+        """
+        self.subtitle_bar_var.set(not self.subtitle_bar)
+        self.on_subtitle_bar_toggle()
 
     # ---------- 画 ----------
     def _subtitle_seconds(self):
@@ -1735,34 +1892,61 @@ class VideoPlayerApp:
         return self.subtitle_set.lines_for(self._subtitle_seconds(),
                                            self.subtitle_mode)
 
-    def _compose_subtitles(self, image, video_box):
+    def _compose_subtitles(self, image, box, placement="overlay"):
         """把字幕贴到 `image`（已合成好的整屏，PIL RGBA）上。
 
-        `video_box` 是视频画面那块矩形 `(x, y, w, h)`：字幕贴着**它的**底部
-        居中，所以有黑边时不会飘进黑边里，全屏时又正好在最下面。
+        `box` 是字幕的容器矩形 `(x, y, w, h)`，两种落点各有出处：
+          · `placement="overlay"` —— box 就是**视频画面那块矩形**：字幕贴着它的
+            底部居中，所以有黑边时不会飘进黑边里，全屏时又正好在最下面；
+          · `placement="bar"` —— box 是窗口底部那条**独立字幕栏**：字幕在栏里
+            垂直居中，一个字都不会压到画面上（见 `_subtitle_bar_height`）。
 
-        字号按视频显示高度算（全屏自动变大），并夹在 `SUBTITLE_FONT_SIZE_MIN/MAX`
-        之间 —— 窗口很小的时候按比例算出来只有几像素，看不清等于没有；
-        4K 全屏时不夹住又会糊脸。
+        `placement="bar"` 时字号按**栏高**算（栏是固定高度的一条），`overlay`
+        时按**画面高度**算（所以全屏时字幕会跟着变大）；两者都夹在 min/max
+        之间 —— 窗口很小时按比例算出来只有几像素，看不清等于没有；4K 全屏时
+        不夹住又会糊脸。
         """
         rows = self._subtitle_rows()
         if not rows:
             return
-        _x, _y, box_w, box_h = video_box
-        if box_w < 40 or box_h < 40:
-            return                      # 画面小到没法放字幕，宁可不画
-        size = max(SUBTITLE_FONT_SIZE_MIN,
-                   min(SUBTITLE_FONT_SIZE_MAX,
-                       int(box_h * SUBTITLE_FONT_SIZE_RATIO)))
-        layer = self._subtitle_renderer.layer(
-            rows, size, int(box_w * SUBTITLE_WIDTH_RATIO))
+        box_x, box_y, box_w, box_h = box
+        if box_w < 40 or box_h < 24:
+            return                      # 太小到没法放字幕，宁可不画
+
+        if placement == "bar":
+            size = max(SUBTITLE_BAR_FONT_MIN,
+                       min(SUBTITLE_BAR_FONT_MAX,
+                           int(box_h * SUBTITLE_BAR_FONT_RATIO)))
+        else:
+            size = max(SUBTITLE_FONT_SIZE_MIN,
+                       min(SUBTITLE_FONT_SIZE_MAX,
+                           int(box_h * SUBTITLE_FONT_SIZE_RATIO)))
+
+        wrap_w = int(box_w * SUBTITLE_WIDTH_RATIO)
+        layer = self._subtitle_renderer.layer(rows, size, wrap_w)
         if layer is None:
             return
         layer_w, layer_h = layer.size
-        paste_x = video_box[0] + (box_w - layer_w) // 2
-        paste_y = (video_box[1] + box_h - layer_h
-                   - max(SUBTITLE_BOTTOM_MARGIN_MIN,
-                         int(box_h * SUBTITLE_BOTTOM_MARGIN_RATIO)))
+
+        if placement == "bar" and layer_h > box_h - 4:
+            # 极端情况才会走到：窗口很矮 + 中英两行各自还折了行（最多 4 行）。
+            # 缩小一档重画，宁愿字小也不许漫到画面上去。
+            # 刻意不做更强的裁剪 —— 裁剪会把字切掉半截，比"压到画面底边一点点"
+            # 更难看。
+            size = max(SUBTITLE_BAR_FONT_MIN,
+                       int(size * max(0.5, (box_h - 6) / float(layer_h))))
+            layer = self._subtitle_renderer.layer(rows, size, wrap_w)
+            if layer is None:
+                return
+            layer_w, layer_h = layer.size
+
+        paste_x = box_x + (box_w - layer_w) // 2
+        if placement == "bar":
+            paste_y = box_y + max(0, (box_h - layer_h) // 2)
+        else:
+            paste_y = (box_y + box_h - layer_h
+                       - max(SUBTITLE_BOTTOM_MARGIN_MIN,
+                             int(box_h * SUBTITLE_BOTTOM_MARGIN_RATIO)))
         image.paste(layer, (paste_x, paste_y), layer)
 
     # ============================================================
@@ -2610,6 +2794,8 @@ class VideoPlayerApp:
             self.toggle_play()
         elif key == "v":
             self.cycle_subtitle_mode()
+        elif key == "b":
+            self.toggle_subtitle_bar()
         else:
             return None
         return "break"
@@ -2706,6 +2892,7 @@ class VideoPlayerApp:
             "↑  /  ↓       音量 +5%%、-5%%\n"
             "M             静音开关\n"
             "V             切换字幕（关闭 → 中文 → 英文 → 中英双语）\n"
+            "B             开关独立字幕栏（字幕挪到画面之外，不再遮画面）\n"
             "F  /  F11     全屏开关\n"
             "F1            显示这份说明\n\n"
             "字幕（把 .srt / .vtt 放在视频旁边、与视频同名即可自动加载）：\n"
@@ -2713,7 +2900,10 @@ class VideoPlayerApp:
             "  也认视频同目录下的 subs / 字幕 子目录；名字看不出语种就按内容判断\n"
             "· 一个文件里中文一行、英文一行的（字幕组最常见的那种），选\n"
             "  【中英双语】就是中文在上、英文在下两行一起显示\n"
-            "· 名字对不上号的（下载下来叫 1.srt 之类）点【载入字幕】手选\n\n"
+            "· 名字对不上号的（下载下来叫 1.srt 之类）点【载入字幕】手选\n"
+            "· 字幕默认画在画面内底部（所有播放器都这样）。觉得遮挡画面 —— 尤其\n"
+            "  是看 3D 的时候 —— 就按 B 或勾上【字幕栏】：窗口底部会切出一条\n"
+            "  纯色横条专放字幕，字幕再也不压画面，代价是画面小一点\n\n"
             "播放列表（右侧那一栏）：\n"
             "· 可以直接把视频文件从资源管理器拖进窗口，拖进来就开始播\n"
             "· 双击列表条目播放它；播完自动播下一项（列表末尾回到第一项）\n"

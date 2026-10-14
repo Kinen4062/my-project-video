@@ -18,10 +18,17 @@
     ⑦ 渲染层：文字真画出来了（有白字也有黑描边）、按内容缓存、折行
     ⑧ 端到端（app）：打开视频自动认领 + **切换模式时画面像素真的变了**
     ⑨ 降级：关掉总开关 / 关掉字幕 / 没有字幕文件 / 字幕文件是垃圾
+    ⑩ 【第 19 轮】独立字幕栏（字幕挪出画面）+ 快捷键**真绑上了 Tk** 的加固
 
 ⑧ 那一节是本套件最要紧的一层，而且它**不查变量、只查像素**：单元测试全绿、
 画面上一个字都没有，是完全可能发生的（算了半天 rows 却没接到渲染那一步），
 只有像素能证明它真的上屏了。
+
+⑩ 那一节是**被一个真 bug 逼出来的**：第 18 轮加了 V 键，`_ALL_SHORTCUT_KEYS`
+里有 `"v"`、`_on_key_shortcut` 里也实现了 `"v"`，但真正的绑定清单是手写的、
+漏了 `<Key-v>` —— 而 ⑧ 节是**直接调 `_on_key_shortcut`** 验的，绕过了 Tk 的
+派发链，于是**测试一整轮全绿、真机上按 V 毫无反应**。所以 ⑩ 节第一件事就是
+挨个问 Tk"这个序列到底绑上没有"，再去发真实按键。
 """
 
 import os
@@ -503,6 +510,203 @@ def body(root, app, fp, s):
     s.check(app._subtitle_rows() == [], "模式=关闭 → 一行都不取")
     app.subtitle_mode = "both"
 
+    # ============================================================
+    s.section("⑩ 独立字幕栏：把字幕挪出画面 + 快捷键真的绑上了 Tk")
+    # ============================================================
+    # 【第 19 轮·加固】先堵住上一轮那个"绿着的假测试"。
+    #
+    # 上一节验 V 键是**直接调 `_on_key_shortcut`** 的 —— 那只证明"这个函数会
+    # 循环模式"，完全不证明"按 V 会有反应"。于是 `<Key-v>` 根本没出现在绑定
+    # 清单里这件事，藏了整整一轮：套件全绿，真机上按 V 一点动静都没有。
+    #
+    # 判据必须问 Tk 自己（`bind_all` 不给函数时返回那条绑定脚本，没绑就是空串），
+    # 不能问我们自己的表 —— 表和绑定不一致正是当初的病根。
+    _SEQ = {"left": "<Left>", "right": "<Right>", "up": "<Up>", "down": "<Down>"}
+    unbound = [k for k in fp._ALL_SHORTCUT_KEYS if k != "space"
+               and not root.bind_all(_SEQ.get(k, "<Key-%s>" % k))]
+    s.check(not unbound,
+            "`_ALL_SHORTCUT_KEYS` 里每个键都真的绑到了 Tk 上（漏绑：%s）"
+            % (unbound or "无"))
+
+    delivered = []
+    degraded = []
+
+    def press(seq):
+        """发一次**真实按键**（连带验证绑定链路）；抢不到焦点才退回直调。
+
+        本环境是无人值守的后台会话，Tk 的键盘焦点会被"窗口失活"清掉，所以
+        每次发之前都要重新抢一次（见 _harness.take_keyboard_focus）。
+        抢不到就退化 —— 但会把退化这件事记下来，绝不让"没测到"看起来像"测过了"。
+        """
+        if take_keyboard_focus(root):
+            root.event_generate(seq)
+            delivered.append(seq)
+        else:
+            degraded.append(seq)
+        root.update()
+
+    app.subtitle_mode = "both"
+    app._sync_subtitle_ui()
+    press("<KeyPress-v>")
+    if not delivered:
+        app._on_key_shortcut(_Key("V", widget=root))     # 退化：别假失败
+    s.check(app.subtitle_mode == "off",
+            "按 V → 模式切到关闭（走的是%s）"
+            % ("真实按键派发" if delivered else "直调，本机抢不到键盘焦点"))
+
+    app.subtitle_mode = "both"
+    app.subtitle_bar = False
+    app._sync_subtitle_ui()
+    app.render_current_frame()
+    press("<KeyPress-b>")
+    if not delivered:
+        app._on_key_shortcut(_Key("b", widget=root))
+    s.check(app.subtitle_bar and app.subtitle_bar_var.get(),
+            "按 B → 字幕栏打开，勾选框也跟着勾上了（B 键与勾选框同一个动作）")
+    s.check("字幕栏" in app._subtitle_status_text(),
+            "状态行说明了字幕栏在生效（%s）" % app._subtitle_status_text())
+
+    # 勾选框**自己那条路**也得验：B 键走 `toggle_subtitle_bar`，勾选框走它自己的
+    # command —— 两条路最后都落到 `on_subtitle_bar_toggle`，但只有真"点"一下
+    # （`invoke()`）才能证明**控件确实接上了回调**（漏了 command= 就会是死勾选框）。
+    app.subtitle_bar_check.invoke()
+    s.check(not app.subtitle_bar and not app.subtitle_bar_var.get(),
+            "点一下勾选框 → 字幕栏关掉（控件回调真的接上了）")
+    app.subtitle_bar_check.invoke()
+    s.check(app.subtitle_bar and app.subtitle_bar_var.get(),
+            "再点一下 → 又打开（勾选框与内部状态始终一致）")
+
+    # ---- 栏高：五条准入条件，一条不满足就不切栏（免得白让画面变小）----
+    win_w, win_h = app._video_area_size()
+    want_h = max(fp.SUBTITLE_BAR_MIN,
+                 min(fp.SUBTITLE_BAR_MAX, int(win_h * fp.SUBTITLE_BAR_RATIO)))
+    bar_h = app._subtitle_bar_height(win_h)
+    s.check(bar_h == want_h,
+            "窗口高 %d → 栏高 %d（= clamp(%.2f × %d, %d, %d)）"
+            % (win_h, want_h, fp.SUBTITLE_BAR_RATIO, win_h,
+               fp.SUBTITLE_BAR_MIN, fp.SUBTITLE_BAR_MAX))
+
+    s.check(app._subtitle_bar_height(fp.SUBTITLE_BAR_MIN_WINDOW_H - 1) == 0,
+            "窗口矮到 %d 像素 → 不切栏（画面会被压得没法看，退回画在画面内）"
+            % (fp.SUBTITLE_BAR_MIN_WINDOW_H - 1))
+
+    keep_mode, keep_set = app.subtitle_mode, app.subtitle_set
+    keep_font = app.subtitle_font_path
+    app.subtitle_mode = "off"
+    s.check(app._subtitle_bar_height(win_h) == 0, "字幕模式=关闭 → 不切栏")
+    app.subtitle_mode = keep_mode
+
+    app.subtitle_set = sub.SubtitleSet()
+    s.check(app._subtitle_bar_height(win_h) == 0,
+            "这一部片子没有字幕 → 不切栏（不留一条空横条白占地方）")
+    app.subtitle_set = keep_set
+
+    app.subtitle_font_path = None
+    s.check(app._subtitle_bar_height(win_h) == 0,
+            "本机找不到中文字体 → 不切栏（反正一个字都画不出来）")
+    app.subtitle_font_path = keep_font
+
+    app.subtitle_bar = False
+    s.check(app._subtitle_bar_height(win_h) == 0,
+            "开关关着 → 栏高 0，等于第 18 轮的行为（默认不变）")
+    app.subtitle_bar = True
+
+    # 栏高**不取决于「这一秒有没有 cue」**：字幕之间有空档，若按 cue 判断，
+    # 栏会在播放中一闪一闪、画面跟着一抽一抽 —— 那比遮挡难看得多。
+    s.check(app._subtitle_bar_height(win_h) == bar_h,
+            "同一部片子里栏高恒定（%d == %d）—— 不随「此刻有没有字幕」抖动"
+            % (app._subtitle_bar_height(win_h), bar_h))
+
+    # ---- 像素证据：栏里是「纯色 + 笔画」，画面里再也没有字幕 ----
+    def snap_now():
+        app.render_current_frame()
+        return np.asarray(app._last_display_image).astype(int)
+
+    def band_stats(img, band_top):
+        """栏带的三个观测量，用来判「这条带里装的是画面还是那条纯色」。
+
+        判据用**最常见颜色的占比**，不用"和某个写死的颜色差多少" ——
+        后者依赖"画面刚好比栏色亮"这种运气（本轮实测踩到：带里装的是画面，
+        但画面下缘偏暗，只有 29% 的像素离栏色足够远，拍脑袋定的 50% 阈值当场假失败）。
+
+        最常见色占比则是两回事差一个量级的东西：
+          · 栏带（纯色 + 字）→ 那个颜色就是栏色，占 **95%** 上下；
+          · 画面带            → 最多的一种颜色只占 **1.4%**（画面本来就不平）。
+        顺带把"最常见的就是我们写进去的那条栏色"一并验了，比原来更强。
+        """
+        band = img[band_top:, :, :3]
+        flat = band.reshape(-1, 3)
+        ink = int((np.abs(band - np.median(flat, axis=0)).sum(axis=2) > 40).sum())
+        colors, counts = np.unique(flat, axis=0, return_counts=True)
+        best = int(np.argmax(counts))
+        return tuple(int(v) for v in colors[best]), counts[best] / float(len(flat)), ink
+
+    band_top = win_h - bar_h
+    area = (win_h - band_top) * win_w
+    bar_rgb = tuple(reversed(fp.SUBTITLE_BAR_COLOR_BGR))   # BGR → RGB
+
+    app.subtitle_bar = True
+    app.subtitle_mode = "zh"
+    zh_bar = snap_now()
+    top_color, top_share, ink_zh = band_stats(zh_bar, band_top)
+    s.check(ink_zh > 0,
+            "开着栏、选中文 → 栏里真的有字（%d 个笔画像素）" % ink_zh)
+    s.check(ink_zh < area * 0.2,
+            "栏里除了字就是那条纯色，没有别的东西（笔画 %d / 栏面积 %d）"
+            % (ink_zh, area))
+    s.check(top_color == bar_rgb and top_share > 0.85,
+            "栏带里最常见的就是写进去的那条栏色 %s，占 %.1f%%"
+            % (top_color, top_share * 100))
+
+    app.subtitle_mode = "both"
+    both_bar = snap_now()
+    d_bar = diff(zh_bar, both_bar)
+    rows = np.where(d_bar.any(axis=1))[0]
+    s.check(len(rows) > 0 and int(rows[0]) >= band_top,
+            "开栏时『中文 → 中英双语』差异的最小行是 y=%s，全在栏内（栏从 y=%d 起）"
+            % ((int(rows[0]) if len(rows) else -1), band_top))
+    s.check(int(d_bar[band_top:].sum()) == int(d_bar.sum()),
+            "**画面区一个像素都没动** —— 加的英文那行只落在栏里（%d / %d）"
+            % (int(d_bar[band_top:].sum()), int(d_bar.sum())))
+
+    app.subtitle_bar = False
+    app.render_current_frame()
+    off_bar = snap_now()
+    off_color, off_share, ink_pic = band_stats(off_bar, band_top)
+    s.check(off_share < 0.10,
+            "关掉栏之后，同一条带里最多的颜色 %s 只占 %.1f%% —— 装的是画面，不是纯色"
+            % (off_color, off_share * 100))
+    s.check(ink_pic > ink_zh * 5,
+            "『带里有画面』与『带里只有字』差着一个量级（%d vs %d）"
+            % (ink_pic, ink_zh))
+
+    # ---- 最后收个尾：状态行、勾选框、以及"关栏就回到原样" ----
+    app.subtitle_bar = False
+    app._sync_subtitle_ui()
+    s.check(not app.subtitle_bar_var.get(), "状态同步：关掉之后勾选框也取消勾选")
+    s.check("字幕栏" not in app._subtitle_status_text(),
+            "关掉之后状态行不再提字幕栏（%s）" % app._subtitle_status_text())
+
+    app.subtitle_bar = True
+    app._sync_subtitle_ui()
+    app.root.geometry("1000x%d" % (fp.SUBTITLE_BAR_MIN_WINDOW_H - 40))
+    app.root.update_idletasks()
+    app.root.update()
+    small_h = app._video_area_size()[1]
+    if small_h < fp.SUBTITLE_BAR_MIN_WINDOW_H:
+        s.check("窗口太矮" in app._subtitle_status_text(),
+                "勾了栏但窗口太矮 → 状态行明说原因（%s）" % app._subtitle_status_text())
+    else:
+        s.note("窗口没被压到 %d 像素以下（实际 %d），这一条跳过了 —— "
+               "不写成必然通过，免得它变成一条永远绿的假断言"
+               % (fp.SUBTITLE_BAR_MIN_WINDOW_H, small_h))
+    app.root.geometry("1000x700")
+    app.root.update_idletasks()
+    app.root.update()
+    app.subtitle_bar = False
+    app.subtitle_mode = "both"
+    app.render_current_frame()
+
 
 if __name__ == "__main__":
-    sys.exit(run_suite("字幕（第 18 轮）", body, subtitles=True))
+    sys.exit(run_suite("字幕（第 18~19 轮）", body, subtitles=True))
