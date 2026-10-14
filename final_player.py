@@ -348,11 +348,39 @@ class PlayState:
 
 class VideoPlayerApp:
     def __init__(self, root):
+        """搭建整个应用。
+
+        【第 12 轮·重构】这个方法原来是 391 行、一口气干七件事，没人能一口气
+        看懂。现在按"职责 + 依赖顺序"拆成 7 段，每段一个方法。
+
+        ⚠️ **调用顺序就是原来的创建顺序**，逐行搬移、逻辑一行没改 ——
+        下面这些顺序依赖是硬约束，重排会坏：
+          · `_init_playback_state` 必须在建控件之前跑完（控件要拿 seek_var /
+            mode_var 当 variable）；
+          · `_build_control_bars` 必须在 `_finish_init` 之前（后者要同步
+            parallax_frame 的显隐）；
+          · 全局键的注册要等控件都建好（bind_class 会作用于之后创建的按钮）。
+        """
         self.root = root
         self.setup_dark_theme()
         self.root.title("AI 3D 播放器 - 测试版")
         self.root.geometry("950x700")
 
+        self._init_playback_state()
+        self._build_video_area()
+        self._build_progress_bar()
+        self._build_control_bars()
+        self._bind_global_shortcuts()
+        self._init_audio_state()
+        self._init_session_state()
+        self._finish_init()
+
+    def _init_playback_state(self):
+        """播放状态、进度条变量、各种定时器句柄、3D 调节量与显示模式、模型句柄。
+
+        必须在建控件之前跑完：下面几个控件要拿 `seek_var` / `mode_var`
+        当 `variable` 传进去。
+        """
         # --- 播放器状态 ---
         self.cap = None
         # 【P2 修复】播放状态收敛为单一枚举（见 PlayState 说明）。
@@ -413,6 +441,12 @@ class VideoPlayerApp:
         self.model = None
         self.image_processor = None
 
+    def _build_video_area(self):
+        """顶层 grid 布局 + 视频显示区（video_container / video_label）。
+
+        为什么必须用 grid 而不是 pack：见下面那段长注释 —— pack 布局下
+        video_label 的"请求尺寸"会随图像变大，把后打包的底栏挤出可视区。
+        """
         # ============================================================
         # 【关键修复】顶层布局改用 grid
         # ------------------------------------------------------------
@@ -448,6 +482,8 @@ class VideoPlayerApp:
         for _w in (self.video_container, self.video_label):
             _w.bind("<Button-1>", self._restore_shortcut_focus)
 
+    def _build_progress_bar(self):
+        """进度条（row 1）与它的三个交互事件"""
         self.progress_frame = tk.Frame(self.root, bg=DARK_BG)
         self.progress_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=5)
 
@@ -462,6 +498,13 @@ class VideoPlayerApp:
         # （on_scale_release 会先检查 _scale_pressed，别处点一下不会误触发）。
         self.root.bind("<ButtonRelease-1>", self.on_scale_release, add="+")
 
+    def _build_control_bars(self):
+        """底栏两行（主操作 / 设置项）、转换进度面板、视差与左右眼控制栏。
+
+        【P2】底栏原来是一整行塞 12 个控件（音量+静音、打开、转换、播放、
+        3D模式、截图、导出、倍速…），950px 宽必然拥挤甚至被裁，所以按用途
+        拆成两行；转换进度面板与视差栏顺延到 row 4 / row 5。
+        """
         # ============================================================
         # 【P2 修复】底栏原来是一整行塞 12 个控件（音量+静音、打开、转换、
         # 播放、3D模式、截图、导出、倍速…），950px 宽必然拥挤甚至被裁。
@@ -586,6 +629,15 @@ class VideoPlayerApp:
         )
         self.btn_swap_eyes.pack(side=tk.LEFT, padx=5)
 
+    def _bind_global_shortcuts(self):
+        """注册全部全局快捷键（bind_all / bind_class / FocusIn 兜底）。
+
+        三条纪律都写在下面的长注释里，改动前务必读：
+          ① 必须用 `bind_all` —— `root.bind` 在焦点落到任何子控件之后**根本不执行**；
+          ② 按钮上的空格要用 `bind_class` 替换掉 Tk 的类绑定 —— 让路撤不回
+             一个已经发生的动作；
+          ③ 焦点窗口为空时按键会被 Tk 全部丢弃，用 `<FocusIn>` 兜底补上。
+        """
         # 【第 11 轮·修正】这几条全局键一律用 **bind_all**，不用 root.bind。
         #
         # 为什么必须改：Tk 的 widget 绑定只在"事件投递到的那个控件就是 root
@@ -637,6 +689,14 @@ class VideoPlayerApp:
         # 【P2 修复】缩放重绘只由 video_container 的 <Configure> 驱动
         # （见 on_window_resize 的说明），不再重复绑 root。
 
+    def _init_audio_state(self):
+        """音频播放器句柄、主时钟基准、后台交接状态、"抢发音量"窗口。
+
+        这一段每个字段都配了半屏注释，因为它们的语义全是踩出来的
+        （尤其 `_audio_handoff_old`、`_audio_suspended_for_seek`、
+        `_audio_volume_resume` 三条）—— 改音频代码前请连同那些注释一起读，
+        别只看字段名。
+        """
         # --- 音频播放状态 ---
         self.audio_player = None  # ffpyplayer 的 MediaPlayer 实例
         self.audio_volume = 1.0  # 音量 0.0 ~ 1.0
@@ -701,6 +761,8 @@ class VideoPlayerApp:
         # 会让新音频一开始就落后半秒（口型对不上）。
         self._last_media_sec = 0.0
 
+    def _init_session_state(self):
+        """本次会话的产物状态（导出按钮只认 session_output_path）"""
         # 【P1】本次会话中"由本程序转换生成"的 3D 文件路径。
         # 导出按钮只认这个字段，不再靠"工作目录里碰巧有个同名文件"来判断，
         # 避免用【打开已有3D视频】载入别的文件后导出上一次的残留产物。
@@ -713,6 +775,11 @@ class VideoPlayerApp:
         # 本构建的 ffpyplayer 只能靠"重建播放器 + ss"定位音频，
         # 且暂停态不能 seek，因此不需要额外状态。
 
+    def _finish_init(self):
+        """收尾：同步视差栏显隐、接上关窗回调、建背景缓存。
+
+        必须放在最后 —— `_sync_parallax_visibility` 依赖 parallax_frame 已建好。
+        """
         # 【P2 修复】最初的显示模式是 2D，此时视差栏没有任何作用，
         # 直接隐藏（切到 3D 模式时会自动出现，见 _sync_parallax_visibility）。
         self._sync_parallax_visibility()
