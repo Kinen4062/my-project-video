@@ -33,6 +33,7 @@
 """
 
 import ctypes
+import itertools
 import os
 import statistics
 import sys
@@ -384,7 +385,41 @@ def take_keyboard_focus(root, widget=None):
         return False
 
 
-def load_app(geometry="1000x700"):
+_app_counter = itertools.count(1)
+
+
+def make_playlist_path():
+    """给一次 app 装载一个**全新的、保证不存在的**播放列表文件（第 14 轮·播放列表）。
+
+    为什么必须隔离（三条，前两条会真出问题，第三条让排查省半小时）：
+      ① 不隔离的话，测试里的 `open_video` 会往用户**真实的** `%APPDATA%`
+         播放列表里写 —— 跑一次回归就把用户的列表搞乱；
+      ② 复用同一个临时文件也不够：**每个套件是独立进程，计数器从 1 重来**，
+         于是所有套件都会落到 `playlist_1.json` 上。前面那组（test_shortcuts
+         也会 `open_video`）留下的条目会串到后面这组，"新窗口列表应该是空的"
+         当场就假失败 —— 这正是本函数第一版踩的坑，而且**只在 `run_tests.py`
+         下复现、单跑某个套件却是绿的**（跨进程串味）。
+      ③ 于是名字里带上 pid，并且**先把同名文件删掉**再交给 app —— 起手状态
+         一定是空列表，与上一次遗留无关。
+    """
+    path = os.path.join(work_dir("_playlist"),
+                        "playlist_%d_%d.json" % (os.getpid(), next(_app_counter)))
+    try:
+        os.remove(path)
+    except OSError:
+        pass                      # 绝大多数情况下本来就不存在，这是正常路径
+    return path
+
+
+def load_app(geometry="1000x700", autoplay_next=False):
+    """装载一个 app。
+
+    `autoplay_next=False`（默认）会关掉**片尾自动续播** —— 老套件量的是
+    "单文件"的片尾行为（片尾回绕卡不卡、测速窗口会不会穿过 EOF），
+    而它们跑的过程中会打开好几个视频、播放列表因此会攒下半打条目；
+    续播一开，片尾就从"回绕同一个文件"变成"切到列表里的下一个"，
+    那些用例量的东西就悄悄变了样子。播放列表自己的套件显式传 True。
+    """
     if PROJ not in sys.path:
         sys.path.insert(0, PROJ)
     import tkinter as tk
@@ -392,7 +427,8 @@ def load_app(geometry="1000x700"):
     root = tk.Tk()
     root.geometry(geometry)
     root.update()
-    app = fp.VideoPlayerApp(root)
+    app = fp.VideoPlayerApp(root, playlist_path=make_playlist_path())
+    app.autoplay_next = autoplay_next
     root.update()
     take_keyboard_focus(root)          # 见函数说明：不抢焦点则按键全被丢弃
     return root, app, fp
@@ -419,10 +455,13 @@ def teardown(root, app):
         pass
 
 
-def run_suite(title, body):
-    """套件统一入口：装载 → 跑 body(root, app, fp, summary) → 收尾 → 返回退出码"""
+def run_suite(title, body, autoplay_next=False):
+    """套件统一入口：装载 → 跑 body(root, app, fp, summary) → 收尾 → 返回退出码
+
+    `autoplay_next` 见 `load_app` 的说明（默认关，播放列表套件传 True）。
+    """
     summary = Summary(title)
-    root, app, fp = load_app()
+    root, app, fp = load_app(autoplay_next=autoplay_next)
     try:
         body(root, app, fp, summary)
     finally:

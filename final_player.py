@@ -27,10 +27,17 @@ from ffpyplayer.player import MediaPlayer
 #   viewfit     —— 取景计算（min 缩放几何 + 四周模糊背景的缓存）
 # 本文件仍然保留同名薄封装方法（`_mux_audio_into_video` / `_process_3d` /
 # `_get_letterbox_bg`），所以**调用点一行都不用改**。
+#
+# 【第 14 轮·播放列表与拖放】又多两个，同样是"不碰 app 状态"的独立件：
+#   playlist_store —— 播放列表的落盘（一个小 JSON，读写失败静默降级）
+#   filedrop       —— 从资源管理器拖文件进来（纯 ctypes，无需第三方库）
+# 它们都跟着仓库一起走，不装任何新依赖。
 # ============================================================
 import media_tools
 import depth3d
 import viewfit
+import playlist_store
+import filedrop
 # 下面这个名字只是**再导出**：实现已经不在本文件里了，
 # 但测试套件引用 `final_player.has_audio_stream`，所以要留着。
 from media_tools import has_audio_stream   # noqa: F401  (re-export)
@@ -70,6 +77,11 @@ BTN_SUCCESS = dict(
     activebackground="#2ecc71", activeforeground="white",
     relief=tk.FLAT, bd=0, padx=8, pady=4,
 )
+
+# 【第 14 轮·播放列表】右侧列表栏的宽度（像素）。
+# 用"固定宽度 + grid_propagate(False)"而不是让 Listbox 按字符数自己撑：
+# 列表项是文件路径，长度千差万别，若按内容撑宽，窗口会被一条长路径顶变形。
+PLIST_MIN_WIDTH = 236
 
 # ============================================================
 # 全局快捷键的"让路"规则
@@ -347,11 +359,11 @@ class PlayState:
 
 
 class VideoPlayerApp:
-    def __init__(self, root):
+    def __init__(self, root, playlist_path=None):
         """搭建整个应用。
 
         【第 12 轮·重构】这个方法原来是 391 行、一口气干七件事，没人能一口气
-        看懂。现在按"职责 + 依赖顺序"拆成 7 段，每段一个方法。
+        看懂。现在按"职责 + 依赖顺序"拆成若干段，每段一个方法。
 
         ⚠️ **调用顺序就是原来的创建顺序**，逐行搬移、逻辑一行没改 ——
         下面这些顺序依赖是硬约束，重排会坏：
@@ -359,17 +371,27 @@ class VideoPlayerApp:
             mode_var 当 variable）；
           · `_build_control_bars` 必须在 `_finish_init` 之前（后者要同步
             parallax_frame 的显隐）；
-          · 全局键的注册要等控件都建好（bind_class 会作用于之后创建的按钮）。
+          · 全局键的注册要等控件都建好（bind_class 会作用于之后创建的按钮）——
+            所以【第 14 轮】新增的 `_build_playlist_panel` 也必须排在
+            `_bind_global_shortcuts` 之前，否则列表栏里的按钮吃不到"空格=播放"。
+
+        `playlist_path` 是播放列表 JSON 的位置；默认走 `playlist_store` 的用户
+        配置目录。测试会传一个临时文件进来 —— 否则跑一次回归就会把用户真实的
+        播放列表覆盖掉，而"列表里有东西"本身又会干扰用例（见 tests/_harness.py）。
         """
         self.root = root
         self.setup_dark_theme()
         self.root.title("AI 3D 播放器 - 测试版")
-        self.root.geometry("950x700")
+        # 【第 14 轮】默认加宽到 1180：右侧多了一栏 236px 的播放列表，
+        # 原来的 950 会让视频区被压得比底栏还窄。
+        self.root.geometry("1180x720")
 
         self._init_playback_state()
+        self._init_playlist_state(playlist_path)
         self._build_video_area()
         self._build_progress_bar()
         self._build_control_bars()
+        self._build_playlist_panel()
         self._bind_global_shortcuts()
         self._init_audio_state()
         self._init_session_state()
@@ -440,6 +462,30 @@ class VideoPlayerApp:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model = None
         self.image_processor = None
+
+    def _init_playlist_state(self, playlist_path=None):
+        """【第 14 轮·新】播放列表的**纯状态**（不建控件）。
+
+        跟 `_init_playback_state` 一样，必须在建控件之前跑完 —— `_build_playlist_panel`
+        要读 `self.playlist` 才能把内容画出来。
+
+        `self.playlist` 就是唯一的事实来源：面板上的 Listbox 只是它的视图，
+        增删一律"先改列表 → 存盘 → 再刷新视图"，避免两边各改各的。
+        """
+        self.playlist = playlist_store.load(playlist_path)
+        self._playlist_path = playlist_path or playlist_store.default_path()
+        # 播不动的项（文件不存在 / 打不开）。**只影响"自动续播"的挑选**：
+        # 编进这个集合是为了让片尾续播能跳过它继续往下找，不至于卡在同一项上
+        # 反复重试（那就成了死循环）。用户手点这一项时照旧播放，等于手动重试。
+        self._playlist_failed = set()
+        # 【第 14 轮】片尾自动续播开关。默认开 —— 列表里有两个以上文件时，
+        # 播完一项自动播下一项（列表尾回到第 1 项），这是播放列表该有的样子。
+        # 关掉它就退回"单文件行为"：播完无缝回绕当前这一个。
+        # 老回归套件会把这项关掉，因为它们量的是**单文件**的片尾行为
+        # （片尾回绕卡不卡、测速窗口会不会穿过 EOF），不该被列表内容牵着走。
+        self.autoplay_next = True
+        self._dnd_enabled = False
+        self._playlist_visible = True
 
     def _build_video_area(self):
         """顶层 grid 布局 + 视频显示区（video_container / video_label）。
@@ -577,6 +623,12 @@ class VideoPlayerApp:
                   command=self.show_shortcuts,
                   **BTN_NORMAL).pack(side=tk.RIGHT, padx=5, pady=10)
 
+        # 【第 14 轮·新】播放列表显隐。放在"快捷键"按钮左边的位置：
+        # 两个都是"不常用到的开关"，挤在最右边不占主操作区。
+        self.btn_playlist = tk.Button(self.btn_frame, text="隐藏列表",
+                                      command=self.toggle_playlist, **BTN_NORMAL)
+        self.btn_playlist.pack(side=tk.RIGHT, padx=5, pady=10)
+
         # ---------- row 3：设置项 ----------
         tk.Label(self.aux_frame, text="3D模式:", bg=DARK_BG, fg=DARK_FG).pack(side=tk.LEFT, padx=(5, 5))
         mode_combo = ttk.Combobox(
@@ -628,6 +680,306 @@ class VideoPlayerApp:
             command=self.toggle_swap_eyes, **BTN_NORMAL,
         )
         self.btn_swap_eyes.pack(side=tk.LEFT, padx=5)
+
+    # ============================================================
+    # 【第 14 轮·新】播放列表
+    # ------------------------------------------------------------
+    # 数据只有一份：`self.playlist`（一个路径列表）。Listbox 只是它的**视图**，
+    # 所有增删一律走"先改列表 → 存盘 → 再刷新视图"，两边不会各改各的。
+    #
+    # 和"打开文件"的关系：任何**用户主动播放**的视频都会自动记进列表
+    # （见 open_video 的 record 参数）—— 这就是需求里的"将要播放的视频记录
+    # 在播放器右侧列表中"。例外只有一种：转换产生的临时产物不算
+    # （它在 %TEMP% 里，下一次转换就会被删掉，记进列表只会留下死条目）。
+    # ============================================================
+    def _build_playlist_panel(self):
+        """右侧播放列表栏（第 1 列，跨越全部 6 行）。
+
+        布局：顶层 grid 本来是"1 列 6 行"，这里开出第 1 列专供列表栏。
+        让列表栏 rowspan=6 占满右边缘、而底栏（进度条 / 按钮 / 进度面板）
+        仍然只占第 0 列 —— 于是底栏会在列表栏左边收住，不会钻到列表下面。
+
+        列宽用 minsize + `pack_propagate(False)` 固定：列表项是文件路径，长短
+        差得远，若让 Listbox 按内容撑宽，窗口会被一条长路径顶变形。
+
+        ⚠️ 这里是 **`pack_propagate`** 不是 `grid_propagate`：面板的**子控件是
+        pack 进去的**，而 `grid_propagate` 只管"用 grid 管理的子控件"，关掉它
+        面板还是会被里面的 Listbox 撑成 20 个字符宽（实测 236 → 169px）。
+
+        ⚠️ 必须在 `_bind_global_shortcuts` 之前调用 —— 那一句 `bind_class`
+        只作用于"当时已经存在"的按钮（见 `__init__` 的顺序说明）。
+        """
+        self.root.grid_columnconfigure(1, weight=0, minsize=PLIST_MIN_WIDTH)
+
+        self.playlist_frame = tk.Frame(self.root, bg=DARK_BG2, width=PLIST_MIN_WIDTH)
+        self.playlist_frame.grid(row=0, column=1, rowspan=6, sticky="ns")
+        self.playlist_frame.pack_propagate(False)
+
+        header = tk.Frame(self.playlist_frame, bg=DARK_BG2)
+        header.pack(side=tk.TOP, fill=tk.X, padx=6, pady=(6, 2))
+        self.playlist_title = tk.Label(
+            header, text="播放列表", bg=DARK_BG2, fg=DARK_FG,
+            font=("Microsoft YaHei", 10, "bold"),
+        )
+        self.playlist_title.pack(side=tk.LEFT)
+
+        # 状态/提示行（放最底，先 pack 的 BOTTOM 在最下面）
+        self.playlist_status = tk.Label(
+            self.playlist_frame, text="可把视频文件直接拖进来",
+            bg=DARK_BG2, fg=DARK_FG2, font=("Microsoft YaHei", 8),
+            anchor="w", justify=tk.LEFT, wraplength=PLIST_MIN_WIDTH - 16,
+        )
+        self.playlist_status.pack(side=tk.BOTTOM, fill=tk.X, padx=6, pady=(0, 6))
+
+        # 操作按钮（两行）
+        btns = tk.Frame(self.playlist_frame, bg=DARK_BG2)
+        btns.pack(side=tk.BOTTOM, fill=tk.X, padx=6, pady=(4, 2))
+        row1 = tk.Frame(btns, bg=DARK_BG2)
+        row1.pack(side=tk.TOP, fill=tk.X)
+        row2 = tk.Frame(btns, bg=DARK_BG2)
+        row2.pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
+        for text, cmd, parent in (
+                ("添加", self.playlist_add_dialog, row1),
+                ("移除", self.playlist_remove_selected, row1),
+                ("清空", self.playlist_clear, row1),
+                ("上一个", self.playlist_prev, row2),
+                ("下一个", self.playlist_next, row2)):
+            tk.Button(parent, text=text, command=cmd,
+                      **BTN_NORMAL).pack(side=tk.LEFT, padx=2)
+
+        # 列表本体 + 滚动条
+        body = tk.Frame(self.playlist_frame, bg=DARK_BG2)
+        body.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=6, pady=4)
+        self.plist_scroll = tk.Scrollbar(body, orient=tk.VERTICAL,
+                                         command=lambda *a: self.playlist_box.yview(*a))
+        self.plist_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.playlist_box = tk.Listbox(
+            body, bg=DARK_BG3, fg=DARK_FG,
+            selectbackground=DARK_ACCENT, selectforeground="#ffffff",
+            highlightthickness=0, bd=0, activestyle="none",
+            selectmode=tk.EXTENDED,
+            # exportselection=False 是关键：否则列表框的选中会和"系统选中区"
+            # 绑定，别处一选东西这边的高亮就没了，看着像"选中丢了"。
+            exportselection=False,
+        )
+        self.playlist_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.playlist_box.config(yscrollcommand=self.plist_scroll.set)
+        self.playlist_box.bind("<Double-Button-1>", self.playlist_play_selected)
+        self.playlist_box.bind("<Return>", self.playlist_play_selected)
+        self.playlist_box.bind("<<ListboxSelect>>", self._on_playlist_select)
+
+    def _video_filetypes(self):
+        """打开/添加对话框的过滤器 —— 与拖放共用 `filedrop.DEFAULT_VIDEO_EXTS`，
+        免得"能拖进来却选不了"这种两处不一致。"""
+        patterns = " ".join("*" + e for e in filedrop.DEFAULT_VIDEO_EXTS)
+        return [("视频文件", patterns), ("MP4 Video", "*.mp4"), ("All Files", "*.*")]
+
+    def _set_playlist_status(self, msg):
+        try:
+            self.playlist_status.config(text=msg)
+        except Exception:
+            pass
+
+    def _save_playlist(self):
+        return playlist_store.save(self.playlist, self._playlist_path)
+
+    def _playlist_index_of(self, path):
+        """路径在列表里的下标；不在列表里（或没在播）返回 None。
+
+        刻意**不缓存**这个下标：列表会被增删、顺序会变，缓存出来的下标迟早
+        和列表对不上。每次从 `current_video_path` 现算，永远自洽。
+        """
+        if not path:
+            return None
+        key = os.path.normcase(path)
+        for i, p in enumerate(self.playlist):
+            if os.path.normcase(p) == key:
+                return i
+        return None
+
+    def _refresh_playlist_ui(self, select_path=None):
+        """把 `self.playlist` 画到 Listbox 上（单向：列表 → 视图）。"""
+        self.playlist_box.delete(0, tk.END)
+        for p in self.playlist:
+            # 显示文件名而不是整条路径：路径动辄上百字符，列表宽度放不下，
+            # 完整路径在选中时显示到下面的状态行里。
+            self.playlist_box.insert(tk.END, os.path.basename(p) or p)
+        self.playlist_title.config(text="播放列表 (%d)" % len(self.playlist))
+
+        idx = self._playlist_index_of(select_path or self.current_video_path)
+        if idx is not None:
+            self.playlist_box.selection_clear(0, tk.END)
+            self.playlist_box.selection_set(idx)
+            self.playlist_box.see(idx)
+
+    def _on_playlist_select(self, event=None):
+        """选中项变化 → 状态行显示它的完整路径（列表里只显示文件名）。"""
+        sel = self.playlist_box.curselection()
+        if not sel:
+            return
+        idx = sel[-1]
+        if 0 <= idx < len(self.playlist):
+            self._set_playlist_status(self.playlist[idx])
+
+    def _playlist_add(self, paths):
+        """加入列表（去重、保持顺序），返回**真正新增**的条数。"""
+        added = 0
+        existing = {os.path.normcase(p) for p in self.playlist}
+        for p in paths:
+            if not p:
+                continue
+            key = os.path.normcase(p)
+            if key in existing:
+                continue
+            existing.add(key)
+            self.playlist.append(p)
+            self._playlist_failed.discard(p)
+            added += 1
+        if added:
+            self._save_playlist()
+            self._refresh_playlist_ui()
+        return added
+
+    def playlist_add_dialog(self):
+        """"添加"按钮：多选视频加进列表；当前没有在播的话，顺手播第一个。"""
+        paths = filedialog.askopenfilenames(
+            title="添加到播放列表", filetypes=self._video_filetypes())
+        paths = list(paths) if paths else []
+        if not paths:
+            return
+        added = self._playlist_add(paths)
+        self._set_playlist_status(
+            "已加入 %d 个视频" % added if added else "这些视频已经在列表里了")
+        if self.play_state == PlayState.IDLE:
+            self._playlist_play(paths[0])
+
+    def playlist_remove_selected(self):
+        """从列表里移除选中项。**不停止播放** —— 移除的是列表条目，不是文件。"""
+        sel = list(self.playlist_box.curselection())
+        if not sel:
+            self._set_playlist_status("先在上面的列表里点一下要移除的条目")
+            return
+        removed = 0
+        for idx in sorted(sel, reverse=True):       # 从后往前删，下标才不会错位
+            if 0 <= idx < len(self.playlist):
+                self._playlist_failed.discard(self.playlist.pop(idx))
+                removed += 1
+        if removed:
+            self._save_playlist()
+            self._refresh_playlist_ui()
+            self._set_playlist_status("已从列表移除 %d 项（文件没有被删）" % removed)
+
+    def playlist_clear(self, confirm=True):
+        """清空列表（只清条目，不删文件、不停止当前播放）。
+
+        `confirm=False` 供测试用 —— 免得 `askyesno` 把无人值守的回归卡在模态框上。
+        """
+        if not self.playlist:
+            return
+        if confirm and not messagebox.askyesno(
+                "清空播放列表",
+                "把列表里的 %d 个视频全部移除？\n"
+                "（只清列表，不会删除文件，也不会停止当前正在播的视频）"
+                % len(self.playlist)):
+            return
+        self.playlist = []
+        self._playlist_failed.clear()
+        self._save_playlist()
+        self._refresh_playlist_ui()
+        self._set_playlist_status("列表已清空")
+
+    def playlist_play_selected(self, event=None):
+        """双击条目 / 在列表里按回车 → 播放它。"""
+        sel = self.playlist_box.curselection()
+        idx = sel[0] if sel else self._playlist_index_of(self.current_video_path)
+        if idx is None or not (0 <= idx < len(self.playlist)):
+            return
+        self._playlist_play(self.playlist[idx])
+
+    def playlist_next(self):
+        self._playlist_step(+1)
+
+    def playlist_prev(self):
+        self._playlist_step(-1)
+
+    def _playlist_step(self, delta):
+        """上一个 / 下一个（按列表顺序，两端循环）。"""
+        n = len(self.playlist)
+        if n == 0:
+            self._set_playlist_status("列表还是空的：先点【添加】或把视频拖进来")
+            return
+        cur = self._playlist_index_of(self.current_video_path)
+        idx = (cur + delta) % n if cur is not None else (0 if delta > 0 else n - 1)
+        self._playlist_play(self.playlist[idx])
+
+    def _playlist_play(self, path):
+        """播放列表里的一项（用户显式点的）。"""
+        # 用户手点 = 手动重试：把它从"播不动"名单里摘出来
+        self._playlist_failed.discard(path)
+        if not os.path.isfile(path):
+            self._set_playlist_status("文件不在了：%s" % os.path.basename(path))
+            return
+        self.open_video(path)
+
+    def _advance_playlist(self):
+        """片尾自动续播：返回下一个要播的路径；没有可续播的项则返回 None。
+
+        规则刻意保守 —— **只有列表里还有别的项时**才返回路径（列表尾回到第 1 项）。
+        于是"只放一个文件"的老用法完全不受影响：那时列表里只有当前这一项，
+        返回 None，走 update_frame 原来的"原地无缝回绕"（不用重新打开文件，
+        也就没有那一下卡顿）。找不到的条目会被记进 `_playlist_failed` 跳过，
+        保证这个循环一定会往前推进，不会卡在同一项上反复重试。
+        """
+        n = len(self.playlist)
+        if not self.autoplay_next or n < 2:
+            return None
+        cur = self._playlist_index_of(self.current_video_path)
+        if cur is None:
+            return None
+        for step in range(1, n):
+            cand = self.playlist[(cur + step) % n]
+            if cand in self._playlist_failed:
+                continue
+            if not os.path.isfile(cand):
+                self._playlist_failed.add(cand)
+                continue
+            return cand
+        return None
+
+    def toggle_playlist(self, event=None):
+        """显示 / 隐藏右侧列表栏。
+
+        隐藏时必须把第 1 列的 minsize 也归零 —— `grid_remove` 只是"不管理这个
+        控件"，列宽约束还在，视频区右边会留下一条 236px 的空带。
+        """
+        if self._playlist_visible:
+            self.playlist_frame.grid_remove()
+            self.root.grid_columnconfigure(1, minsize=0)
+            self._playlist_visible = False
+            self.btn_playlist.config(text="显示列表")
+        else:
+            self.playlist_frame.grid()
+            self.root.grid_columnconfigure(1, minsize=PLIST_MIN_WIDTH)
+            self._playlist_visible = True
+            self.btn_playlist.config(text="隐藏列表")
+        # 尺寸变了会触发 video_container 的 <Configure>，画面自动重绘，这里不用管
+
+    def _on_files_dropped(self, paths):
+        """资源管理器把文件拖进窗口了（`filedrop` 已保证：主线程 + 在 Tk 队列里）。
+
+        行为：把拖进来的视频全部加进列表，并立刻播第一个。
+        """
+        videos = filedrop.expand_dropped_paths(paths)
+        if not videos:
+            self._set_playlist_status("拖进来的东西里没有能播的视频文件")
+            return
+        added = self._playlist_add(videos)
+        if len(videos) == 1:
+            msg = "已拖入：%s" % (os.path.basename(videos[0]) or videos[0])
+        else:
+            msg = "已拖入 %d 个视频（新增 %d 个）" % (len(videos), added)
+        self._set_playlist_status(msg)
+        self._playlist_play(videos[0])
 
     def _bind_global_shortcuts(self):
         """注册全部全局快捷键（bind_all / bind_class / FocusIn 兜底）。
@@ -794,6 +1146,14 @@ class VideoPlayerApp:
         # "每 N 帧重算一次"的常量是 viewfit.BG_REFRESH_INTERVAL）
         self._bg = viewfit.LetterboxBgCache()
 
+        # 【第 14 轮·新】播放列表：把上次退出时的列表画出来，再接上"拖文件进来"。
+        # 放在最后是因为拖放要用已经建好的主窗口句柄（winfo_id）。
+        self._refresh_playlist_ui()
+        self._dnd_enabled = filedrop.enable_file_drop(self.root, self._on_files_dropped)
+        if not self._dnd_enabled:
+            # 拖放是可选增强（非 Windows 没有）：说清楚，别让人以为程序坏了
+            self._set_playlist_status("本平台不支持拖放；请用【添加】按钮")
+
     # ============================================================
     # 【P2 修复】播放状态的两个"视图"属性
     # ------------------------------------------------------------
@@ -917,10 +1277,21 @@ class VideoPlayerApp:
         """
         return self._bg.get(frame, win_w, win_h)
 
-    def open_video(self, file_path=None):
+    def open_video(self, file_path=None, record=True):
+        """打开（并开始播放）一个视频文件。
+
+        `record=True` 时会把这个文件记进右侧播放列表 —— 这是需求里"将要播放的
+        视频记录在播放器右侧列表中"的落点。唯一的例外是**转换产生的临时产物**
+        （`on_conversion_done` 传 record=False）：它躺在 %TEMP% 里，下次转换就
+        会被删掉，记进列表只会留下永远点不开的死条目。
+
+        返回 True = 已经开始播放这个文件；False = 用户取消了对话框，或者文件
+        打不开。片尾自动续播靠这个返回值判断"要不要把这一项标记成播不动"。
+        """
         if file_path is None:
-            file_path = filedialog.askopenfilename(filetypes=[("MP4 Video", "*.mp4"), ("All Files", "*.*")])
-            if not file_path: return
+            file_path = filedialog.askopenfilename(filetypes=self._video_filetypes())
+            if not file_path:
+                return False
 
         # 停止旧视频的播放循环，防止定时器叠加导致加速
         # 【P2 修复】原来这里是手写两行（is_playing=False + 取消定时器），
@@ -933,7 +1304,7 @@ class VideoPlayerApp:
         self.cap = cv2.VideoCapture(file_path)
         if not self.cap.isOpened():
             messagebox.showerror("错误", "无法打开视频文件")
-            return
+            return False
 
         # 释放旧的音频播放器
         # 【本次修复】换文件前必须先作废正在进行的后台交接：那次交接可能还有
@@ -975,10 +1346,17 @@ class VideoPlayerApp:
 
         self.update_frame()
 
+        # 【第 14 轮·新】记进播放列表（放在"已经真的能播"之后 —— 打不开的文件
+        # 不该进列表），并把它高亮成当前项。
+        if record:
+            self._playlist_add([file_path])
+            self._refresh_playlist_ui(select_path=file_path)
+
         # 【第 11 轮·修正 2】刚选完文件的用户，下一个动作几乎一定是播放/暂停。
         # 而此刻焦点还留在"打开视频"那个按钮上 —— 空格会被按钮吃掉（重新打开
         # 文件对话框），"按空格没反应"的观感就是这么来的。这里主动把焦点收回来。
         self._restore_shortcut_focus()
+        return True
 
     def start_conversion(self):
         if self.is_converting:
@@ -1236,7 +1614,7 @@ class VideoPlayerApp:
             except Exception:
                 pass
 
-        self.open_video(output_path)
+        self.open_video(output_path, record=False)
 
         # 【P2 修复】原来这里无条件把模式切成"红蓝3D"，提示语也直接假设
         # 用户有红蓝眼镜 —— 没有眼镜的人会看到一张奇怪的叠影图，还以为
@@ -1596,8 +1974,12 @@ class VideoPlayerApp:
             "M             静音开关\n"
             "F  /  F11     全屏开关\n"
             "F1            显示这份说明\n\n"
+            "播放列表（右侧那一栏）：\n"
+            "· 可以直接把视频文件从资源管理器拖进窗口，拖进来就开始播\n"
+            "· 双击列表条目播放它；播完自动播下一项（列表末尾回到第一项）\n"
+            "· 一次拖多个文件、甚至整个文件夹都行，会全部加进列表\n\n"
             "万一按键没反应：点一下画面即可。\n"
-            "（焦点停在按钮/滑块/下拉框上时，那几个键在该控件上有自己\n"
+            "（焦点停在按钮/滑块/下拉框/播放列表上时，那几个键在该控件上有自己\n"
             "　的用途，会先让给它用 —— 点画面就把焦点收回来。）"
             % SHORTCUT_SEEK_STEP_SEC,
         )
@@ -2025,6 +2407,21 @@ class VideoPlayerApp:
         start_time = time.time()
         ret, frame = self.cap.read()
         if not ret:
+            # 【第 14 轮·新】先问播放列表：还有下一项就切过去，而不是在原地绕圈。
+            #   ⚠️ 必须**立刻 return** —— open_video 内部已经停掉旧的播放循环、
+            #   重新排好了下一帧；这里再往下走就会再排一次，两套定时器叠加
+            #   = 画面以两倍速跑（第 1 轮踩过的那种"加速"）。
+            #   `force=True`（暂停态重绘一帧）**不续播**：那不是"播完了"，
+            #   只是用户改了视差/切了模式要刷新一张画面，不能顺手把文件换掉。
+            next_path = self._advance_playlist() if not force else None
+            if next_path is not None:
+                if not self.open_video(next_path):
+                    # 文件在、但解不开（编码坏了等）：记下来，下一轮续播会跳过它，
+                    # 本帧到此为止 —— 不要再往下走和 3D 处理抢状态。
+                    self._playlist_failed.add(next_path)
+                return
+
+            # 没有可续播的项 → 保持原来的"原地循环回绕"。
             # 【P1 修复】循环回绕：视频跳回第 0 帧，音频也必须一起回到 0 秒。
             # 原来只重置了视频，音频继续往后走，第二遍起音画永久错位。
             # eos 之后必须整体重建播放器才能让音频从 0 秒重新开始
