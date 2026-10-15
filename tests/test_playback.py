@@ -16,6 +16,7 @@
  10. 稳态播放速度
  11. 冷启动后立刻拖动（抢发窗口来不及开）
  12. 三个按钮合成两个：打开视频 / 转换为3d ★第 22 轮
+ 13. 已经是 3D 的视频别再转一次 ★第 23 轮
 """
 
 import os
@@ -27,7 +28,8 @@ import cv2
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _harness import (FrameProbe, Mixer, city_fixture, drag,  # noqa: E402
-                      make_noaudio_fixture, measure_speed, measure_speed_window,
+                      make_3d_fixture, make_flat_fixture, make_noaudio_fixture,
+                      measure_speed, measure_speed_window,
                       pump, run_suite, to_mixer_level, work_dir)
 
 # 【第 22 轮】本次运行的唯一标签。凡是要"写一个文件"的断言都得放在
@@ -392,6 +394,135 @@ def body(root, app, fp, s):
     s.check(warned and warned[0] == "提示",
             "点【转换为3d】真的进到了 start_conversion（走真实 invoke）")
     s.check(app.is_converting is False, "验完把 is_converting 还原（别留给后面的用例）")
+
+    # ---------------------------------------------------------- 13
+    s.section("【第 23 轮】已经是 3D 的视频，别再转一次")
+    # 起因是用户报的现场：对一个左右分屏的视频点了【转换为3d】，程序照着
+    # 「2D → 3D」又拆了一遍（得到四格画面），控制台还刷出一大屏红色重试日志。
+    # 这一节同样**绝不真的跑转换**：检测器是纯函数，直接喂素材验；守门逻辑
+    # 靠替换 messagebox 验；模型加载靠假类验。
+
+    mt = fp.media_tools          # final_player 里是 `import media_tools`
+    d3 = os.path.join(work_dir("detect3d"), "run_" + _RUN_TAG)
+    os.makedirs(d3, exist_ok=True)
+    sbs_3d = make_3d_fixture(os.path.join(d3, "gen_sbs.mp4"), city, axis="sbs")
+    tab_3d = make_3d_fixture(os.path.join(d3, "gen_tab.mp4"), city, axis="tab")
+    flat = make_flat_fixture(os.path.join(d3, "gen_flat.mp4"), city)
+
+    # --- ① 检测器本身（media_tools.detect_3d_layout，纯函数）---
+    s.check(mt.detect_3d_layout(city) is None, "city.mp4 是 2D → 不判 3D")
+    s.check(mt.detect_3d_layout(sbs_3d) == "sbs", "左右分屏素材 → 判 sbs")
+    s.check(mt.detect_3d_layout(tab_3d) == "tab", "上下分屏素材 → 判 tab")
+    s.check(mt.detect_3d_layout(flat) is None,
+            "纯色/黑场 → **不判 3D**（两半一模一样，只看残差必然误判）")
+    s.check(mt.detect_3d_layout(os.path.join(d3, "不存在.mp4")) is None,
+            "文件不存在 → None（不抛异常）")
+
+    # --- ② 守门逻辑：3D 会被劝住，2D 完全不打扰 ---
+    box = {"answer": False, "calls": 0, "title": ""}
+    orig_ask = fp.messagebox.askyesno
+
+    def _fake_ask(title=None, msg=None, **kw):
+        box["calls"] += 1
+        box["title"] = title or ""
+        return box["answer"]
+
+    fp.messagebox.askyesno = _fake_ask
+    try:
+        box["answer"] = False
+        s.check(app._confirm_convert(sbs_3d) is False, "3D 视频 + 用户点【否】→ 不转")
+        s.check(box["calls"] == 1 and box["title"] == "这个视频已经是 3D 的",
+                "弹的是「已经是 3D」那个对话框")
+
+        box["answer"] = True
+        s.check(app._confirm_convert(sbs_3d) is True,
+                "3D 视频 + 用户点【是】→ 放行（刻意留了这个出口）")
+
+        box["calls"] = 0
+        s.check(app._confirm_convert(city) is True, "2D 视频 → 放行")
+        s.check(box["calls"] == 0, "2D 视频**根本不弹对话框**（不打扰正常流程）")
+    finally:
+        fp.messagebox.askyesno = orig_ask
+
+    # --- ③ 这道关真的接在转换路径上（不是写了没人调）---
+    orig_confirm = app._confirm_convert
+    asked = []
+    app._confirm_convert = lambda p: (asked.append(p), False)[1]
+    try:
+        app.start_conversion(sbs_3d)
+    finally:
+        app._confirm_convert = orig_confirm
+    s.check(asked == [sbs_3d], "start_conversion 确实先过了守门那一关")
+    s.check(app.is_converting is False, "被劝住之后没有真的开始转换")
+    _th = getattr(app, "conversion_thread", None)
+    s.check(_th is None or not _th.is_alive(), "也没有留下在跑的转换线程")
+
+    # --- ④ 模型加载：先本地、后联网（那行红字重试日志的根因）---
+    #
+    # 模型下过之后本地就是完整的，但 from_pretrained 默认还会向 Hub 发一次
+    # HEAD 问"有没有新版本"。本机 HF_ENDPOINT 指向 hf-mirror.com，那一问经常
+    # SSL 断流 → 控制台刷一大屏红色 MaxRetryError + "Retrying in 1s [Retry n/5]"，
+    # 用户以为转换失败了，其实模型就在本地。所以要先走 local_files_only=True。
+    class _FakeModel:
+        def to(self, device):
+            self.device = device
+            return self
+
+    def _fake_classes(store, fail_local=False, fail_all=False):
+        def _make(name):
+            class _C(object):
+                @staticmethod
+                def from_pretrained(model_id, local_files_only=False, **kw):
+                    store.append((name, local_files_only))
+                    if fail_all or (local_files_only and fail_local):
+                        raise OSError("假的：本地没有 / 全都失败")
+                    return _FakeModel() if name == "model" else object()
+            return _C
+        return _make("processor"), _make("model")
+
+    orig_proc = fp.AutoImageProcessor
+    orig_mdl = fp.AutoModelForDepthEstimation
+    saved_model, saved_proc = app.model, app.image_processor
+    try:
+        # ① 缓存够用 → 只走本地，一次网都不联
+        store = []
+        app.model = None
+        app.image_processor = None
+        fp.AutoImageProcessor, fp.AutoModelForDepthEstimation = _fake_classes(store)
+        app._load_depth_model()
+        s.check(store == [("processor", True), ("model", True)],
+                "缓存够用时只调 local_files_only=True（红字重试从此不会出现）")
+        s.check(app.model is not None and app.image_processor is not None,
+                "两样都挂上了")
+
+        # ② 本地不全 → 退回联网那条路
+        store = []
+        app.model = None
+        app.image_processor = None
+        fp.AutoImageProcessor, fp.AutoModelForDepthEstimation = _fake_classes(
+            store, fail_local=True)
+        app._load_depth_model()
+        s.check(store[0] == ("processor", True), "第一次总是先试本地")
+        s.check(store[-1] == ("model", False), "本地不成 → 最后走的是联网")
+
+        # ③ 两条路都不成 → 如实抛，且**不留半套状态**
+        store = []
+        app.model = None
+        app.image_processor = None
+        fp.AutoImageProcessor, fp.AutoModelForDepthEstimation = _fake_classes(
+            store, fail_all=True)
+        raised = False
+        try:
+            app._load_depth_model()
+        except Exception:
+            raised = True
+        s.check(raised, "本地没有、联网也失败 → 抛出去（外层会弹「转换错误」）")
+        s.check(app.model is None and app.image_processor is None,
+                "失败后不留半套状态（模型没到手，processor 也不挂上去）")
+    finally:
+        fp.AutoImageProcessor = orig_proc
+        fp.AutoModelForDepthEstimation = orig_mdl
+        app.model, app.image_processor = saved_model, saved_proc
 
 
 if __name__ == "__main__":

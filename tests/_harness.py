@@ -41,6 +41,7 @@ import tempfile
 import time
 
 import cv2
+import numpy as np
 
 
 def _force_utf8_streams():
@@ -143,6 +144,85 @@ def make_noaudio_fixture(dst, src=None, seconds=3.0):
         cap.release()
     if n == 0:
         raise RuntimeError("造无音轨素材失败：源视频一帧都没读到")
+    return dst
+
+
+def make_3d_fixture(dst, src=None, px=6, axis="sbs", seconds=2.0):
+    """造一份"**已经是 3D**"的素材，返回路径。
+
+    【第 23 轮】测"已经是 3D 的视频别再转一次"要用它。刻意**不**调用真正的
+    转换（那要加载深度模型、跑几分钟），而是照着 `process_video_to_3d` 的排法
+    手工拼：左眼 = 原帧按 +px 采样、右眼 = 按 -px 采样，再拼起来 ——
+    这正是本程序产物的形态（两半是同一幅画的两个视点）。
+
+    `axis="sbs"` 左右拼（2560x720 那种），`axis="tab"` 上下拼。
+    常量视差 = "整幅画都在同一个深度平面"，是 3D 里最平凡的一种，够用了。
+    """
+    src = src or city_fixture()
+    cap = cv2.VideoCapture(src)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    want = int(fps * seconds)
+    size = (w * 2, h) if axis == "sbs" else (w, h * 2)
+    writer = cv2.VideoWriter(dst, cv2.VideoWriter_fourcc(*"mp4v"), fps, size)
+    xs, ys = np.meshgrid(np.arange(w), np.arange(h))
+    xs = xs.astype(np.float32)
+    ys = ys.astype(np.float32)
+    shift = np.full((h, w), float(px), np.float32)
+    n = 0
+    try:
+        while n < want:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if axis == "sbs":
+                near = cv2.remap(frame, xs + shift, ys, cv2.INTER_LINEAR,
+                                 borderMode=cv2.BORDER_REPLICATE)
+                far = cv2.remap(frame, xs - shift, ys, cv2.INTER_LINEAR,
+                                borderMode=cv2.BORDER_REPLICATE)
+                writer.write(cv2.hconcat([near, far]))
+            else:
+                near = cv2.remap(frame, xs, ys + shift, cv2.INTER_LINEAR,
+                                 borderMode=cv2.BORDER_REPLICATE)
+                far = cv2.remap(frame, xs, ys - shift, cv2.INTER_LINEAR,
+                                borderMode=cv2.BORDER_REPLICATE)
+                writer.write(cv2.vconcat([near, far]))
+            n += 1
+    finally:
+        writer.release()
+        cap.release()
+    if n == 0:
+        raise RuntimeError("造 3D 素材失败：源视频一帧都没读到")
+    return dst
+
+
+def make_flat_fixture(dst, src=None, seconds=1.5, color=(240, 240, 240)):
+    """造一份"**几乎没有细节**"的视频（纯色 + 顶上一窄条噪声），返回路径。
+
+    【第 23 轮】这是 3D 布局探测**最容易假阳**的一类：纯色帧的左右两半
+    "完全一样"（残差 0.06，比真 3D 还小），只看残差必然把它判成左右分屏 3D。
+    真实的翻黑场、纯色片头、纯黑过场都是这一类。
+
+    顶上那条噪声带是**刻意**留的：它让"整帧的均值"看起来还有内容，
+    而真正能识破的是**中位数** —— 这个素材就是用来钉住"别用均值当判据"的。
+    """
+    src = src or city_fixture()
+    cap = cv2.VideoCapture(src)
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    want = max(1, int(fps * seconds))
+    writer = cv2.VideoWriter(dst, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    rng = np.random.default_rng(7)
+    try:
+        for _ in range(want):
+            frame = np.full((h, w, 3), color, np.uint8)
+            frame[:6, :] = rng.integers(0, 60, (6, w, 3), dtype=np.uint8)
+            writer.write(frame)
+    finally:
+        writer.release()
+        cap.release()
     return dst
 
 

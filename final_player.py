@@ -3030,6 +3030,8 @@ class VideoPlayerApp:
             file_path = self._conversion_source()
         if not file_path:
             return
+        if not self._confirm_convert(file_path):
+            return
 
         self.is_converting = True
         self.conversion_cancel_event.clear()
@@ -3077,6 +3079,40 @@ class VideoPlayerApp:
             filetypes=[("MP4 Video", "*.mp4"), ("All Files", "*.*")],
         ) or None
 
+    def _confirm_convert(self, file_path):
+        """这个文件真的该转吗？返回 False = 被劝住了，不转。
+
+        【第 23 轮·新】对**已经是 3D 的视频**劝一句。用户的报错现场就是这样：
+        对一个左右分屏的视频点了【转换为3d】，程序照着「2D → 3D」又拆了一遍，
+        得到四格画面（每一半又被拆成左右两份），还白烧几分钟算力。
+        用户点这个按钮时真正想找的，多半是"它前面那个原始的 2D 文件"。
+
+        判据用像素证据（`media_tools.detect_3d_layout`），**刻意不看文件名** ——
+        名字里带 "3D" 的 2D 片子多的是（`XXX.3D.1080p` 很多其实是普通 2D 源），
+        靠名字判会把它们误伤。
+
+        ⚠️ 检测不出来（返回 None）**一律放行**：把一段真 2D 拦住（用户想转却
+        转不了）比放过一段已经是 3D 的（白转几分钟）更难受。
+
+        ⚠️ 留了"仍然转换"的出口、而不是做成硬拦截：识别总有可能看错，硬拦之后
+        用户就只能来找作者改代码了。默认按钮是【否】，所以一路回车仍然是安全的
+        —— 想强行转必须专门去点【是】。
+        """
+        layout = media_tools.detect_3d_layout(file_path)
+        if layout is None:
+            return True
+        what = "左右分屏" if layout == "sbs" else "上下分屏"
+        return messagebox.askyesno(
+            "这个视频已经是 3D 的",
+            "检测到它本身已经是 3D 视频（%s）：\n"
+            "%s\n\n"
+            "再转一次，程序会把每一半再拆成左右两份，得到四格画面，还要白花\n"
+            "几分钟（以及一次模型推理）。你要找的多半是它前面那个**原始的 2D 文件**。\n\n"
+            "如果确定是程序看错了（这确实是 2D 视频），点【是】照样转。"
+            % (what, os.path.basename(file_path)),
+            default=messagebox.NO,
+        )
+
     @staticmethod
     def _make_temp_output_path():
         """为本次转换生成一个系统临时目录下的唯一输出路径。
@@ -3089,6 +3125,53 @@ class VideoPlayerApp:
         name = "ai3d_%s.mp4" % uuid.uuid4().hex[:10]
         return os.path.join(tempfile.gettempdir(), name)
 
+    def _load_depth_model(self):
+        """加载深度估计模型。**先只用本地缓存**，缓存不全才联网。
+
+        【第 23 轮·修】原来直接 `from_pretrained(model_id)`：模型下过之后本地
+        已经有完整副本（`~/.cache/huggingface/hub/...`，含 model.safetensors），
+        但 `from_pretrained` 默认还会向 Hub 发一次 HEAD 去问"有没有新版本"。
+
+        本机把 `HF_ENDPOINT` 指向了 hf-mirror.com（见文件顶部的环境变量设置），
+        那个镜像时不时 SSL 断流，于是控制台会刷出一大片：
+
+            'MaxRetryError("HTTPSConnectionFactory... SSLEOFError ...")'
+             thrown while requesting HEAD https://hf-mirror.com/...
+            Retrying in 1s [Retry 1/5].
+
+        红色、带异常栈、还重试 5 次 —— 用户看到只会以为"转换失败了"，
+        而模型其实就躺在本地。先走 `local_files_only=True` 就不会有这些请求，
+        顺带还能离线用。
+
+        只有本地缓存真的不全（比如第一次用）时才退回到联网下载那条路。
+        """
+        if self.model is not None:
+            return
+        model_id = "depth-anything/Depth-Anything-V2-Small-hf"
+        for local_only in (True, False):
+            if local_only:
+                print("正在加载深度估计模型（本地缓存）...")
+            else:
+                print("正在加载深度估计模型（联网下载）...")
+            try:
+                processor = AutoImageProcessor.from_pretrained(
+                    model_id, local_files_only=local_only)
+                model = AutoModelForDepthEstimation.from_pretrained(
+                    model_id, local_files_only=local_only)
+            except Exception as e:
+                if local_only:
+                    print("本地缓存里没有完整的深度模型（%s），改为联网获取..." % e)
+                    continue
+                raise
+            # ⚠️ 两个都拿到手了才一起挂上去。分两步赋值的话，万一 model 加载
+            #    失败，`self.image_processor` 已经非空 —— 而外面判的是
+            #    `if self.model is None`，下次进来会重新走一遍，中间这段
+            #    半套状态还容易让人误以为"模型已经好了"。
+            self.image_processor = processor
+            self.model = model.to(self.device)
+            print("模型加载完成！")
+            return
+
     def process_video_to_3d(self, input_path):
         output_path = self._make_temp_output_path()
         cap = None
@@ -3096,11 +3179,7 @@ class VideoPlayerApp:
         cancelled = False
         try:
             if self.model is None:
-                print("正在加载深度估计模型...")
-                model_id = "depth-anything/Depth-Anything-V2-Small-hf"
-                self.image_processor = AutoImageProcessor.from_pretrained(model_id)
-                self.model = AutoModelForDepthEstimation.from_pretrained(model_id).to(self.device)
-                print("模型加载完成！")
+                self._load_depth_model()
 
             cap = cv2.VideoCapture(input_path)
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -3694,7 +3773,9 @@ class VideoPlayerApp:
             "· 【转换为3d】把**当前正在播的这个视频**转成一个左右分屏的 3D 文件\n"
             "  （还没打开任何视频就会让你选一个）；转完会问你要不要另存下来。\n"
             "  想事后补存：当前播的就是上次转出来的那份产物时，再点它一次即可，\n"
-            "  那一下会被理解成「另存」（产物本身是左右分屏，再转只会得到四格）\n\n"
+            "  那一下会被理解成「另存」（产物本身是左右分屏，再转只会得到四格）。\n"
+            "  **已经是 3D 的视频会被劝住**（识别是看像素，不是看文件名）——\n"
+            "  再转一次只会得到四格画面，真要转可以在那个提示里点【是】\n\n"
             "字幕（把 .srt / .vtt 放在视频旁边、与视频同名即可自动加载）：\n"
             "· 认 `电影.srt`、`电影.zh.srt`、`电影.en.srt`、`电影.中英.srt` 这些写法，\n"
             "  也认视频同目录下的 subs / 字幕 子目录；名字看不出语种就按内容判断\n"

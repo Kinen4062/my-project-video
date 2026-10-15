@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""跟外部媒体工具（ffmpeg）打交道的纯函数。
+"""对媒体文件做"只看文件、不动状态"的纯函数。
 
 【第 12 轮·重构】从 `final_player.py` 里搬出来的第一块。这三个函数要么只吃参数、
 要么只碰传进来的路径，**完全不读写 VideoPlayerApp 的状态** —— 所以搬出来不会
@@ -18,6 +18,9 @@
 
 import os
 import subprocess
+
+import cv2
+import numpy as np
 
 
 FFMPEG_MUX_TIMEOUT_SEC = 300      # 单次 mux 的超时；超时即放弃音轨（大文件也够）
@@ -133,3 +136,144 @@ def mux_audio_into_video(video_path, audio_source_path, ffmpeg,
         remove_quietly(tmp_path)
         return False
     return True
+
+
+# ============================================================
+# 【第 23 轮·新】3D 布局探测：这个视频**本身**是不是已经排成了 3D？
+# ============================================================
+# 起因：用户对一个已经是 3D（左右分屏）的视频点了【转换为3d】，程序照着
+# 「2D → 3D」又转了一遍 —— 得到的是四格画面（每一半又被拆成左右两份），
+# 还白烧几分钟算力。
+#
+# 判据：左右（或上下）两半是不是**同一幅画面的两个视点**（本程序的产物正是
+# `left = remap(frame, x+shift)` / `right = remap(frame, x-shift)` 拼起来的）。
+# 下面三组数全部来自实测打表，见 docs/final_player_第23轮_*.md：
+#
+#   · 真 3D（本程序产物 / 合成 SBS / 合成 TAB）：err_best 0.77~9.39，梯度中位 19.4~41.3
+#   · 真 2D（city.mp4 / 录屏 / bug1.mp4）      ：err_best 29.8~65.7，梯度中位 13.0~23.6
+#   · 纯色 / 翻黑场 / 加黑边                  ：err_best 0.06~12.0，**梯度中位 0.0~5.7**
+#
+# ⚠️ 最后一行才是真正的坑：**纯色帧的两半"完全一样"，长得和真 3D 一模一样**
+# （残差 0.06，比真 3D 还小）。所以只看残差必然把黑场、纯色片头误判成 3D。
+# 把它俩分开的是"这一帧有没有细节可比" —— 梯度中位数。低于 DETAIL_MIN 的帧
+# 直接跳过、不投票；整段视频一帧都不够判时返回 None（= 不拦）。
+DETECT_HALF_SIZE = 200        # 每个半幅缩到这个宽度/高度再比（统一位移尺度、也够快）
+DETECT_MAX_SHIFT = 8          # 在半幅 200px 的尺度上搜 ±8px 位移（≈ ±4%）
+DETECT_SAMPLE_FRAMES = 6      # 均匀取样帧数
+DETECT_DETAIL_MIN = 8.0       # 该帧的梯度中位数 ≥ 它才算"够判"
+DETECT_ERR_MAX = 15.0         # 最佳位移下的平均残差 < 它 → 两半像同一幅画
+DETECT_MED_MAX = 8.0          # 残差中位数 < 它 → 一半以上像素都对得上
+DETECT_VOTE_SHARE = 0.6       # 够判的帧里要有这个比例投同一票才下结论
+DETECT_MIN_USABLE = 2         # 至少这么多帧够判，否则不下结论
+
+
+def _shift_abs_diff(a, b, axis, d):
+    """把 `b` 沿 `axis` 平移 `d` 像素后与 `a` 逐像素比，返回差值图。
+
+    越界部分用 edge 复制填充 —— 用 0 填充会在边缘造出一条假的"高差异带"，
+    把本来匹配得上的两半硬拉低。
+    """
+    pad = DETECT_MAX_SHIFT
+    if axis == 1:
+        bp = np.pad(b, ((0, 0), (pad, pad)), mode="edge")
+        return np.abs(a - bp[:, pad + d: pad + d + a.shape[1]])
+    bp = np.pad(b, ((pad, pad), (0, 0)), mode="edge")
+    return np.abs(a - bp[pad + d: pad + d + a.shape[0], :])
+
+
+def _half_match_stats(frame, axis):
+    """把 frame 沿 axis 劈成两半，量"它们像不像同一幅画"。劈不开 → None。
+
+    `axis=1` 左右劈（SBS），`axis=0` 上下劈（TAB）。
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    if axis == 1:
+        if gray.shape[1] % 2:
+            return None
+        a, b = gray[:, :gray.shape[1] // 2], gray[:, gray.shape[1] // 2:]
+    else:
+        if gray.shape[0] % 2:
+            return None
+        a, b = gray[:gray.shape[0] // 2, :], gray[gray.shape[0] // 2:, :]
+
+    # 缩到统一步长：位移是"像素"单位，不统一尺度就没法共用一套阈值
+    span = a.shape[1] if axis == 1 else a.shape[0]
+    scale = DETECT_HALF_SIZE / float(span)
+    if scale < 1.0:
+        size = (int(round(a.shape[1] * scale)), int(round(a.shape[0] * scale)))
+        a = cv2.resize(a, size, interpolation=cv2.INTER_AREA)
+        b = cv2.resize(b, size, interpolation=cv2.INTER_AREA)
+    a = a.astype(np.float32)
+    b = b.astype(np.float32)
+
+    best_err, best_map = None, None
+    for d in range(-DETECT_MAX_SHIFT, DETECT_MAX_SHIFT + 1):
+        diff = _shift_abs_diff(a, b, axis, d)
+        err = float(diff.mean())
+        if best_err is None or err < best_err:
+            best_err, best_map = err, diff
+
+    gx = cv2.Sobel(a, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(a, cv2.CV_32F, 0, 1, ksize=3)
+    return {
+        "err_best": best_err,
+        "med": float(np.median(best_map)),
+        # "够不够判"的凭据：这一帧自己有多少细节。用**中位数**而不是均值 ——
+        # 均值会被一条窄噪声带（合成纯色样本顶上那 6 行）拉高，而中位数
+        # 如实地说"这块画面整体是平的"。
+        "grad_med": float(np.median(np.sqrt(gx * gx + gy * gy))),
+    }
+
+
+def _sample_frames(cap, total, count):
+    """在整段里均匀取 `count` 帧。
+
+    跳过头尾各 8%：片头常是黑场/厂标、片尾常是字幕卡，都不代表正片。
+    """
+    frames = []
+    for i in range(count):
+        if total > 1:
+            idx = int(total * (0.08 + 0.84 * i / max(count - 1, 1)))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, min(idx, total - 1))
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        frames.append(frame)
+    return frames
+
+
+def detect_3d_layout(path, sample_frames=DETECT_SAMPLE_FRAMES):
+    """这个视频**本身**是不是已经排成了 3D 布局？
+
+    返回 `"sbs"`（左右分屏）/ `"tab"`（上下分屏）/ `None`（不是，或者看不出来）。
+
+    ⚠️ **看不出来一律返回 None（= 放行）**，这是刻意的取舍：把一段真 2D 拦住
+    （用户想转却转不了）比放过一段已经是 3D 的（白转几分钟）更难受。
+    所以只在"证据够硬"时才下结论 —— 够判的帧要够多，且其中多数投同一票。
+    """
+    if not path or not os.path.exists(path):
+        return None
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return None
+    try:
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+        frames = _sample_frames(cap, total, sample_frames)
+    finally:
+        cap.release()
+
+    # 两个方向分别投票：一段视频不可能既是左右分屏又是上下分屏，
+    # 所以把两边的"够判帧数"分开数（合成一个会把分母算大、谁都过不了线）。
+    for axis, name in ((1, "sbs"), (0, "tab")):
+        usable = hits = 0
+        for frame in frames:
+            stats = _half_match_stats(frame, axis)
+            if stats is None or stats["grad_med"] < DETECT_DETAIL_MIN:
+                continue                      # 纯色/黑场/几乎没细节 → 这一帧说了不算
+            usable += 1
+            if (stats["err_best"] < DETECT_ERR_MAX
+                    and stats["med"] < DETECT_MED_MAX):
+                hits += 1
+        if usable >= DETECT_MIN_USABLE and hits >= usable * DETECT_VOTE_SHARE:
+            return name
+    return None
