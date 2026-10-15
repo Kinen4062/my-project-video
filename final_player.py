@@ -90,12 +90,9 @@ BTN_PRIMARY = dict(
     relief=tk.FLAT, bd=0, padx=8, pady=4,
 )
 
-# 成功按钮（绿底，用于导出）
-BTN_SUCCESS = dict(
-    bg="#27ae60", fg="white",
-    activebackground="#2ecc71", activeforeground="white",
-    relief=tk.FLAT, bd=0, padx=8, pady=4,
-)
+# 【第 22 轮】原来这里还有一个 BTN_SUCCESS（绿底，给【导出3D视频】用）。
+# 那个按钮并进【转换为3d】之后它就没有任何引用了 —— 按本仓库对"只声明、
+# 不使用"的一贯态度（P2 那轮清过一批）删掉，要用再照 BTN_PRIMARY 加回来。
 
 # 【第 14 轮·播放列表】右侧列表栏的宽度（像素）。
 # 用"固定宽度 + grid_propagate(False)"而不是让 Listbox 按字符数自己撑：
@@ -1226,7 +1223,7 @@ class VideoPlayerApp:
         # 【P2 修复】底栏原来是一整行塞 12 个控件（音量+静音、打开、转换、
         # 播放、3D模式、截图、导出、倍速…），950px 宽必然拥挤甚至被裁。
         # 现在按用途拆成两行：
-        #   row 2  btn_frame —— 主操作（打开 / 转换 / 播放 / 截图 / 导出）
+        #   row 2  btn_frame —— 主操作（打开视频 / 转换为3d / 播放 / 截图）
         #   row 3  aux_frame —— 设置项（3D模式 / 倍速 / 音量）
         # 转换进度面板与视差栏顺延到 row 4 / row 5。
         # ============================================================
@@ -1269,13 +1266,23 @@ class VideoPlayerApp:
         self.btn_cancel_convert.pack(side=tk.LEFT, padx=5)
 
         # ---------- row 2：主操作 ----------
-        # 【P2 修复】btn_open / btn_screenshot / btn_export 从来只被赋值、
-        # 没有任何地方引用它们，改为局部变量（Tk 控件由父容器的 children
-        # 持有，不会被回收）。真正需要保留引用的只有后面要改文案/状态的几个。
-        tk.Button(self.btn_frame, text="打开已有3D视频",
+        # 【第 22 轮·改】这一行原来有三个按钮：
+        #     打开已有3D视频 / 导入2D视频一键转3D / 导出3D视频
+        # 合成两个：
+        #     【打开视频】  选文件就播 —— 原「打开已有3D视频」。去掉名字里的
+        #                   "3D"是因为它本来就跟源文件无关：本程序对任何视频
+        #                   都是**实时** 2D→3D 渲染，"打开"只是打开。
+        #     【转换为3d】  源 = 当前视频（没有就选一个）→ 转 → **转完问存哪儿**。
+        #                   原来「导入2D视频一键转3D」和「导出3D视频」是分开的
+        #                   两步（转完只留一句"点导出可另存"），现在合成一条：
+        #                   转换的自然收尾就是"要不要存下来"，导出不再是常驻按钮。
+        # 【P2 修复】btn_screenshot 从来只被赋值、没有任何地方引用它，改为局部
+        # 变量（Tk 控件由父容器的 children 持有，不会被回收）。真正需要保留
+        # 引用的只有后面要改文案/状态的几个。
+        tk.Button(self.btn_frame, text="打开视频",
                   command=self.open_video, **BTN_NORMAL).pack(side=tk.LEFT, padx=5, pady=10)
 
-        self.btn_convert = tk.Button(self.btn_frame, text="导入2D视频一键转3D",
+        self.btn_convert = tk.Button(self.btn_frame, text="转换为3d",
                                      command=self.start_conversion, **BTN_PRIMARY)
         self.btn_convert.pack(side=tk.LEFT, padx=5, pady=10)
 
@@ -1284,9 +1291,6 @@ class VideoPlayerApp:
 
         tk.Button(self.btn_frame, text="截图",
                   command=self.save_screenshot, **BTN_NORMAL).pack(side=tk.LEFT, padx=5, pady=10)
-
-        tk.Button(self.btn_frame, text="导出3D视频",
-                  command=self.export_3d_video, **BTN_SUCCESS).pack(side=tk.LEFT, padx=5, pady=10)
 
         # 【第 11 轮·新】快捷键提示入口。放最右边，不挤占主操作区
         # （这一行本来就偏满，见 P2 记录里关于底栏拥挤的说明）。
@@ -1862,10 +1866,10 @@ class VideoPlayerApp:
         self._audio_retire_threads = []
 
     def _init_session_state(self):
-        """本次会话的产物状态（导出按钮只认 session_output_path）"""
+        """本次会话的产物状态（"另存"永远只认 session_output_path）"""
         # 【P1】本次会话中"由本程序转换生成"的 3D 文件路径。
-        # 导出按钮只认这个字段，不再靠"工作目录里碰巧有个同名文件"来判断，
-        # 避免用【打开已有3D视频】载入别的文件后导出上一次的残留产物。
+        # 另存只认这个字段，不再靠"工作目录里碰巧有个同名文件"来判断，
+        # 避免用【打开视频】载入别的文件后另存到上一次的残留产物。
         self.session_output_path = None
         # 【第 11 轮·新】上一次转换产物有没有成功补上音轨（给完成提示用，见
         # _mux_audio_into_video —— cv2.VideoWriter 不写音轨，转换收尾要补一次）
@@ -3008,14 +3012,22 @@ class VideoPlayerApp:
         self._restore_shortcut_focus()
         return True
 
-    def start_conversion(self):
+    def start_conversion(self, file_path=None):
+        """把源视频转成 3D（左右分屏 SBS）。
+
+        【第 22 轮·改】`file_path=None` 时**不再无条件弹文件对话框**，而是先看
+        "当前正在播放的是哪个视频" —— 于是「打开视频 → 转换为3d」成了一条清楚
+        的两步流程，也顺带让"先看看 2D 效果再决定转不转"成为可能。
+        显式传 `file_path` 时完全按传进来的来（测试与程序内部调用走这条）。
+
+        真正的源文件选择逻辑在 `_conversion_source()` 里。
+        """
         if self.is_converting:
             messagebox.showwarning("提示", "正在转换中，请稍候...")
             return
 
-        file_path = filedialog.askopenfilename(
-            filetypes=[("MP4 Video", "*.mp4"), ("All Files", "*.*")]
-        )
+        if file_path is None:
+            file_path = self._conversion_source()
         if not file_path:
             return
 
@@ -3024,7 +3036,9 @@ class VideoPlayerApp:
 
         # 显示转换进度面板
         self.conversion_frame.grid()
-        self.conv_label.config(text="正在加载模型，请稍候...")
+        # 把源文件名写进首行：转换要跑几分钟，用户得能看出"转的是哪一个"
+        self.conv_label.config(text="正在加载模型，请稍候...（%s）"
+                                    % os.path.basename(file_path))
         self.conv_progress_var.set(0)
         self.btn_cancel_convert.config(text="取消转换", state=tk.NORMAL)
 
@@ -3036,6 +3050,32 @@ class VideoPlayerApp:
         )
         self.conversion_thread.daemon = True
         self.conversion_thread.start()
+
+    def _conversion_source(self):
+        """这次转换该拿哪个文件当输入。返回 None = 没得转（用户取消）。
+
+        优先级：**当前正在播放的视频** → 文件对话框。
+
+        ⚠️ 当前播着的就是**本次转换的产物**时不能拿它当源：产物是左右分屏
+        （SBS），再转一次只会得到"四格"画面，白烧几分钟算力。而那一刻用户
+        真正想做的事其实是"把这份产物另存下来" —— 所以就在【转换为3d】上
+        把它做了（问一句再存，不搞静默的行为切换）。
+        """
+        current = self.current_video_path
+        if current and current == self.session_output_path:
+            if messagebox.askyesno(
+                    "当前播放的是转换产物",
+                    "当前这个视频就是上一次转换出来的 3D 产物（左右分屏）。\n\n"
+                    "要把它另存为正式文件吗？\n"
+                    "（想转换别的视频，请先点【打开视频】）"):
+                self.export_3d_video()
+            return None
+        if current and os.path.exists(current):
+            return current
+        return filedialog.askopenfilename(
+            title="选择要转换为 3D 的视频",
+            filetypes=[("MP4 Video", "*.mp4"), ("All Files", "*.*")],
+        ) or None
 
     @staticmethod
     def _make_temp_output_path():
@@ -3246,7 +3286,7 @@ class VideoPlayerApp:
     def _reset_conversion_ui(self):
         """恢复转换按钮和进度面板到初始状态"""
         self.is_converting = False
-        self.btn_convert.config(text="导入2D视频一键转3D", state=tk.NORMAL)
+        self.btn_convert.config(text="转换为3d", state=tk.NORMAL)
         self.conversion_frame.grid_remove()
         self.conv_progress_var.set(0)
         self.conv_label.config(text="转换中: 0/0 (0%)")
@@ -3268,21 +3308,37 @@ class VideoPlayerApp:
         # （每转一次都是一个新路径），显式说清楚比"碰巧没有记录"可靠。
         self.open_video(output_path, record=False, resume=False)
 
+        # 【第 22 轮·改】原来这里只留一句"点【导出3D视频】可另存为正式文件"的
+        # 提示，用户看完还得再去点一次那个按钮。现在底栏没有导出按钮了 ——
+        # **转换这一步的自然收尾就是问一句"要不要存下来"**，这正是"三个按钮
+        # 合成两个"的落点。
+        #
+        # 问的顺序（并存/切模式是两个互相独立的问题，合成一个对话框只会让
+        # 语义变糊 —— 比如"想另存但不想切红蓝3D"的人就没法表达）：
+        #   ① 先问另存 —— 转换刚跑完，最自然的收尾是"把这几分钟的成果存下来"；
+        #   ② 再问要不要切红蓝3D —— 保持 P2 定下的行为，绝不假设用户有眼镜。
+        want_save = messagebox.askyesno(
+            "转换完成",
+            "3D 视频已生成（左右分屏格式）。\n"
+            "%s\n\n"
+            "要把它另存为正式文件吗？\n"
+            "（选【否】就只在这里预览；临时文件会在下次转换时自动清理）\n\n"
+            "临时文件位置：\n%s"
+            % ("已保留原视频的音轨。" if self._last_output_has_audio else
+               "产物未包含音轨（没找到 ffmpeg，或源视频本身没有声音）。",
+               output_path)
+        )
+        if want_save:
+            self.export_3d_video()
+
         # 【P2 修复】原来这里无条件把模式切成"红蓝3D"，提示语也直接假设
         # 用户有红蓝眼镜 —— 没有眼镜的人会看到一张奇怪的叠影图，还以为
         # 转换坏了。现在改成先问一句：要就切，不要就保持 2D 左右分屏
         # （转换产物本身就是 SBS 格式，2D 下也能正常看）。
         switch_3d = messagebox.askyesno(
-            "转换完成",
-            "3D 视频已生成（左右分屏格式）。\n\n"
-            "%s\n\n"
+            "显示方式",
             "现在切换到【红蓝3D】模式吗？\n"
-            "（需要戴红蓝眼镜才能看出立体感；选'否'则保持 2D 左右分屏显示）\n\n"
-            "临时文件位置：\n%s\n\n"
-            "点【导出3D视频】可另存为正式文件。"
-            % ("已保留原视频的音轨。" if self._last_output_has_audio else
-               "产物未包含音轨（没找到 ffmpeg，或源视频本身没有声音）。",
-               output_path)
+            "（需要戴红蓝眼镜才能看出立体感；选'否'则保持 2D 左右分屏显示）"
         )
         if switch_3d:
             self.display_mode = "红蓝3D"
@@ -3632,6 +3688,13 @@ class VideoPlayerApp:
             "B             开关独立字幕栏（字幕挪到画面之外，不再遮画面）\n"
             "F  /  F11     全屏开关\n"
             "F1            显示这份说明\n\n"
+            "底栏那两个主按钮：\n"
+            "· 【打开视频】选一个视频就播。2D 的、已经是 3D 的都能开 ——\n"
+            "  本程序是**实时**把 2D 画面转成 3D 显示的，跟源文件是不是 3D 无关\n"
+            "· 【转换为3d】把**当前正在播的这个视频**转成一个左右分屏的 3D 文件\n"
+            "  （还没打开任何视频就会让你选一个）；转完会问你要不要另存下来。\n"
+            "  想事后补存：当前播的就是上次转出来的那份产物时，再点它一次即可，\n"
+            "  那一下会被理解成「另存」（产物本身是左右分屏，再转只会得到四格）\n\n"
             "字幕（把 .srt / .vtt 放在视频旁边、与视频同名即可自动加载）：\n"
             "· 认 `电影.srt`、`电影.zh.srt`、`电影.en.srt`、`电影.中英.srt` 这些写法，\n"
             "  也认视频同目录下的 subs / 字幕 子目录；名字看不出语种就按内容判断\n"
@@ -3842,22 +3905,37 @@ class VideoPlayerApp:
         messagebox.showinfo("截图成功", "截图已保存到：\n%s" % os.path.abspath(save_path))
 
     def export_3d_video(self):
-        """将本次转换生成的3D视频导出为一个独立文件。
+        """把本次转换的产物另存为一个正式文件。返回 True = 确实存下去了。
 
-        【P1 修复】只导出 session_output_path 记录的那个文件。
-        原来判断的是工作目录下有没有 "temp_3d_output.mp4"，
-        于是"打开已有3D视频"载入别的文件后点导出，导出的会是上一次
-        转换遗留的残留产物（甚至可能是中途报错留下的残缺文件）。
+        【P1 修复】只认 `session_output_path` 记录的那个文件，**绝不看**
+        "工作目录里有没有同名文件" —— 否则用【打开视频】载入别的文件之后
+        再导出，导出的会是上一次转换遗留的残留产物（甚至可能是中途报错
+        留下的残缺文件）。
+
+        【第 22 轮·改】底栏那个常驻的「导出3D视频」按钮去掉了（三个按钮合成
+        两个），但这条能力一点没少，只是换成两个更贴场景的入口：
+          · 转换刚结束 —— `on_conversion_done` 问"要另存吗"，走的就是这里；
+          · 事后想补存 —— 当前正在播的就是产物时，再点【转换为3d】也走这里
+            （见 `_conversion_source`：那个状态下"再转一次"没有意义，
+            产物本身就是左右分屏，再转只会得到四格画面）。
         """
         temp_file = self.session_output_path
         if not temp_file or not os.path.exists(temp_file):
             messagebox.showwarning(
                 "提示",
-                "还没有可导出的3D视频。\n"
-                "请先点击【导入2D视频一键转3D】完成一次转换，再点击导出。"
+                "还没有可另存的3D视频。\n"
+                "请先点【转换为3d】完成一次转换。"
             )
-            return
+            return False
 
+        return self._save_converted_as(temp_file)
+
+    def _save_converted_as(self, temp_file):
+        """弹"另存为"对话框，把 `temp_file` 复制过去。返回是否存成。
+
+        `temp_file` 必须**由调用方显式传进来** —— 这是 P1 那条教训的结构化
+        落地：要导出的路径永远来自"我们记下的那一个"，而不是再查一次磁盘。
+        """
         save_path = filedialog.asksaveasfilename(
             defaultextension=".mp4",
             filetypes=[("MP4 Video", "*.mp4")],
@@ -3866,13 +3944,15 @@ class VideoPlayerApp:
         )
 
         if not save_path:
-            return
+            return False
 
         try:
             shutil.copy(temp_file, save_path)
-            messagebox.showinfo("导出成功", f"3D视频已成功导出到：\n{save_path}\n\n可以直接发送给朋友，或使用支持3D的播放器观看。")
         except Exception as e:
             messagebox.showerror("导出错误", f"导出失败：\n{str(e)}")
+            return False
+        messagebox.showinfo("导出成功", f"3D视频已成功导出到：\n{save_path}\n\n可以直接发送给朋友，或使用支持3D的播放器观看。")
+        return True
 
     def _clamp_seek_frame(self, frame):
         """把跳转目标夹进有效帧范围。

@@ -195,7 +195,7 @@ def body(root, app, fp, s):
     s.section("④ 播放的视频会被记录进列表（需求原文）")
     app.open_video(city)
     pump(root, 0.3)
-    s.check(city in app.playlist, "用【打开已有3D视频】播放的文件进了列表")
+    s.check(city in app.playlist, "用【打开视频】播放的文件进了列表")
     s.check(app.playlist_box.curselection() and
             app.playlist_box.get(app.playlist_box.curselection()[0]) == os.path.basename(city),
             "当前正在播的那一项被高亮出来")
