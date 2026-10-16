@@ -389,7 +389,12 @@ print("PREFIX_IS_INTERNAL=%s" % os.path.basename(sys.prefix) == "_internal")   #
 打包耗时           141.9 秒（共打过 6 次，范围 140~164 秒；含模型解析那 ~30 秒）
 产物 exe           46.4 MB
 产物整个文件夹     934.5 MB
+分发包             dist/final_player_win64.zip   409.3 MB（压 78 秒）
 ```
+
+**发出去的就是那个 zip**：对方解压后双击 `final_player.exe`。`build_exe.py` 默认会顺手压好
+（`--no-zip` 可跳过），zip 里还带了一份自动生成的 `使用说明.txt`（含"怎么用 / 第一次打开会
+遇到什么 / 出问题怎么自检并报障"）。
 
 体积构成（实测）：
 
