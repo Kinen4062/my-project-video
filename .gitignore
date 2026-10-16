@@ -58,3 +58,8 @@ depth_output.jpg
 online.json
 *online.json
 final_player_config.json
+
+# 【第 25 轮】用户偏好（半宽 SBS 开关）。同样正常存在 %APPDATA%/final_player/
+# 下、项目目录之外；这行是兜底。写 `/settings.json` 只忽略**根目录**那一个 ——
+# 不带斜杠会连将来任何子目录里的同名文件一起忽略，那是把网撒太大了。
+/settings.json

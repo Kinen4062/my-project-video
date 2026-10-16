@@ -97,6 +97,7 @@ import depth3d
 import viewfit
 import playlist_store
 import resume_store
+import settings_store
 import subtitle
 # 【第 20 轮·在线字幕匹配】去 OpenSubtitles 要一份现成的字幕。
 # 与其它本地模块同一路子：纯逻辑、不碰 Tk、网络层可注入（所以它能离线测）。
@@ -170,7 +171,7 @@ _ARROW_KEYS = ("left", "right", "up", "down")
 # 第 19 轮把它改成了"照着这张表生成绑定"，就是为了堵住第 18 轮那个坑：
 # 当时表里有 "v"、`_on_key_shortcut` 里也实现了 "v"，但绑定清单是手写的、
 # 漏掉了 `<Key-v>`，于是**测试全绿、真机上 V 键完全没反应**。
-_ALL_SHORTCUT_KEYS = _ARROW_KEYS + ("space", "m", "f", "j", "k", "l", "v", "b")
+_ALL_SHORTCUT_KEYS = _ARROW_KEYS + ("space", "m", "f", "j", "k", "l", "v", "b", "h")
 
 # 真正"要打字"的控件：空格打空格、方向键移光标、字母变输入内容 → 全让。
 TEXT_INPUT_WIDGETS = (tk.Entry, ttk.Entry, tk.Text)
@@ -1047,7 +1048,8 @@ class SubtitleSearchDialog:
 
 
 class VideoPlayerApp:
-    def __init__(self, root, playlist_path=None, resume_path=None):
+    def __init__(self, root, playlist_path=None, resume_path=None,
+                 settings_path=None):
         """搭建整个应用。
 
         【第 12 轮·重构】这个方法原来是 391 行、一口气干七件事，没人能一口气
@@ -1069,6 +1071,10 @@ class VideoPlayerApp:
 
         【第 17 轮】`resume_path` 是"记忆播放位置"那份 JSON 的位置，同样由测试
         传临时文件进来（理由逐字同上：不能把用户真实的观看进度覆盖掉）。
+
+        【第 25 轮】`settings_path` 是用户偏好（目前只有"半宽 SBS"）那份 JSON
+        的位置。测试必须传临时文件 —— 否则套件里一按 H 键就把用户真实的偏好
+        改了，接下来几个用例的行为会跟着变。
         """
         self.root = root
         self.setup_dark_theme()
@@ -1080,6 +1086,7 @@ class VideoPlayerApp:
         self._init_playback_state()
         self._init_playlist_state(playlist_path)
         self._init_resume_state(resume_path)
+        self._init_settings_state(settings_path)
         self._init_subtitle_state()
         self._build_video_area()
         self._build_progress_bar()
@@ -1205,6 +1212,22 @@ class VideoPlayerApp:
         self._resume_positions = resume_store.load(self._resume_path)
         self.resume_enabled = True
         self._resume_ignored = set()
+
+    def _init_settings_state(self, settings_path=None):
+        """【第 25 轮·新】用户偏好的**纯状态**（不建控件、不碰播放）。
+
+        目前只有一个键 `half_sbs`（半宽 SBS）。它**同时管两头** —— 转换输出
+        怎么排、播放合成要不要先拉伸 —— 因为这两件事本来就是同一个格式约定
+        的两端：产物是半宽的，播放就得按半宽认。拆成两个开关，用户迟早会把
+        它们调成互相矛盾的组合（转出半宽、却按全宽播），然后画面是扁的。
+
+        必须排在 `_build_control_bars` 之前：底栏那个勾选框要拿 `half_sbs_var`
+        当 variable（和 seek_var / mode_var 一个道理）。
+        """
+        self._settings_path = settings_path or settings_store.default_path()
+        # load() 保证把 DEFAULTS 里的键全部补齐，所以这里取键不会拿到 None
+        self._settings = settings_store.load(self._settings_path)
+        self.half_sbs = bool(self._settings["half_sbs"])
 
     def _init_subtitle_state(self):
         """【第 18 轮·新】字幕的**纯状态**（不建控件、不碰播放）。
@@ -1500,6 +1523,22 @@ class VideoPlayerApp:
             self.aux_frame, text="搜索…",
             command=self.open_subtitle_search, **BTN_NORMAL)
         self.btn_online_search.pack(side=tk.LEFT, padx=(4, 0))
+
+        # 【第 25 轮·新】半宽 SBS 开关（也可按 H 键）。
+        # 一个开关管两头：转换时每半横向压一半输出（产物 = 16:9，全屏天然
+        # 铺满、左右各占一半），播放时按半宽认（合成 3D 前先把每半拉回 2 倍）。
+        # 放在设置行末尾：它和 3D模式 / 倍速 / 音量 一样是"我要怎么看"，
+        # 不占主操作行；主操作行早就满了（见第 22 轮的按钮合并）。
+        # 状态会存进用户配置目录，下次启动还是这个选择。
+        self.half_sbs_var = tk.BooleanVar(value=self.half_sbs)
+        self.half_sbs_check = tk.Checkbutton(
+            self.aux_frame, text="半宽SBS", variable=self.half_sbs_var,
+            command=self.on_half_sbs_toggle,
+            bg=DARK_BG, fg=DARK_FG, selectcolor=DARK_BG3,
+            activebackground=DARK_BG, activeforeground=DARK_FG,
+            highlightthickness=0, bd=0,
+        )
+        self.half_sbs_check.pack(side=tk.LEFT, padx=(14, 0))
 
         # --- 视差与左右眼控制栏（仅 3D 模式有意义，见 _sync_parallax_visibility）---
         self.parallax_frame = tk.Frame(self.root, bg=DARK_BG)
@@ -2722,6 +2761,36 @@ class VideoPlayerApp:
         self.subtitle_bar_var.set(not self.subtitle_bar)
         self.on_subtitle_bar_toggle()
 
+    def on_half_sbs_toggle(self):
+        """【第 25 轮·新】勾选框回调：半宽 SBS 开关。
+
+        它改的是**格式约定**，两头都跟着变（见 `_init_settings_state`）。所以：
+
+          ① **存盘** —— 否则下次启动又回到默认值，用户会以为设置没保住；
+          ② **重绘当前帧** —— 3D 模式下"要不要先把每半拉回 2 倍"变了，画面
+             必须立刻反映出来。播放中下一帧自然就跟上了，但**暂停态**不会：
+             少了这一句就是"勾了半天画面纹丝不动"。
+
+        转换进行中改它也是安全的：`process_video_to_3d` 在开头把 `self.half_sbs`
+        抄进局部变量，输出尺寸从那一刻就定死了，中途改不会让 VideoWriter
+        一会儿宽一会儿窄（那样会直接写失败）。新设置从下一次转换开始生效。
+        """
+        new_value = bool(self.half_sbs_var.get())
+        self.half_sbs = new_value
+        self._settings["half_sbs"] = new_value
+        settings_store.save(self._settings, self._settings_path)
+
+        if self.current_raw_frame is not None:
+            self.current_frame_image = self._process_3d(self.current_raw_frame)
+            self.render_current_frame()
+        # 勾选框点过之后焦点留在它身上，空格会去拨这个勾选框而不是播放/暂停
+        self._restore_shortcut_focus()
+
+    def toggle_half_sbs(self):
+        """H 键：开关半宽 SBS（与勾选框走完全同一条路，不另写一份逻辑）。"""
+        self.half_sbs_var.set(not self.half_sbs)
+        self.on_half_sbs_toggle()
+
     # ---------- 画 ----------
     def _subtitle_seconds(self):
         """当前**正在显示的那一帧**的媒体时刻（秒）。"""
@@ -3300,8 +3369,17 @@ class VideoPlayerApp:
             fps = cap.get(cv2.CAP_PROP_FPS)
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
+            # 【第 25 轮】半宽 SBS：每半横向压一半再并排 → 产物整幅宽度 = 源宽度，
+            # 于是产物本身就是 16:9，全屏时左右各占一半、天然铺满（既不用裁、
+            # 也不用压扁）。关掉它就是老行为：每半原样，产物是 32:9。
+            #
+            # ⚠️ 先在局部变量里**快照**一次：输出尺寸一旦开始写就不能变，
+            #    转换中途去拨勾选框会让 VideoWriter 直接写失败。
+            half_sbs = self.half_sbs
+            eye_w = max(2, width // 2) if half_sbs else width
+            out_w = eye_w * 2
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(output_path, fourcc, fps, (width * 2, height))
+            out = cv2.VideoWriter(output_path, fourcc, fps, (out_w, height))
 
             max_disparity = 20
             x_base, y_base = np.meshgrid(np.arange(width), np.arange(height))
@@ -3352,6 +3430,13 @@ class VideoPlayerApp:
                                      cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
                 right_eye = cv2.remap(frame, x_base - shift, y_base,
                                       cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+                if half_sbs:
+                    # 每半横向压一半。缩小用 INTER_AREA（同 viewfit.fit_min 的判断）
+                    left_eye = cv2.resize(left_eye, (eye_w, height),
+                                          interpolation=cv2.INTER_AREA)
+                    right_eye = cv2.resize(right_eye, (eye_w, height),
+                                           interpolation=cv2.INTER_AREA)
 
                 sbs_frame = np.hstack((left_eye, right_eye))
                 out.write(sbs_frame)
@@ -3781,6 +3866,8 @@ class VideoPlayerApp:
             self.cycle_subtitle_mode()
         elif key == "b":
             self.toggle_subtitle_bar()
+        elif key == "h":
+            self.toggle_half_sbs()
         else:
             return None
         return "break"
@@ -3878,6 +3965,7 @@ class VideoPlayerApp:
             "M             静音开关\n"
             "V             切换字幕（关闭 → 中文 → 英文 → 中英双语）\n"
             "B             开关独立字幕栏（字幕挪到画面之外，不再遮画面）\n"
+            "H             开关半宽 SBS（转换输出与播放识别共用同一个约定）\n"
             "F  /  F11     全屏开关\n"
             "F1            显示这份说明\n\n"
             "底栏那两个主按钮：\n"
@@ -3913,6 +4001,15 @@ class VideoPlayerApp:
             "· 可以直接把视频文件从资源管理器拖进窗口，拖进来就开始播\n"
             "· 双击列表条目播放它；播完自动播下一项（列表末尾回到第一项）\n"
             "· 一次拖多个文件、甚至整个文件夹都行，会全部加进列表\n\n"
+            "半宽 SBS（底栏那个勾选框 / H 键）：\n"
+            "· 勾上时【转换为3d】输出的每一半是横向压了一半的，产物整幅跟原来的\n"
+            "  视频一样宽（16:9）—— 全屏时左右各占半个屏幕、正好铺满，不裁也不压扁\n"
+            "· 程序自己也按这个约定显示：红蓝/偏振这些模式在合成前会把每半拉回 2 倍，\n"
+            "  所以看到的比例是正常的；不戴眼镜直接看时，两份画面就是扁的\n"
+            "· 关掉它 = 老做法：每半原样并排，产物是 32:9（两份都完整，但全屏时\n"
+            "  上下会留黑边）\n"
+            "· 看**别人给的**全宽 3D 片（正常比例、左右两份并排的那种）时，记得把\n"
+            "  这个勾去掉，否则画面会被横向拉长\n\n"
             "万一按键没反应：点一下画面即可。\n"
             "（焦点停在按钮/滑块/下拉框/播放列表上时，那几个键在该控件上有自己\n"
             "　的用途，会先让给它用 —— 点画面就把焦点收回来。）"
@@ -5522,9 +5619,13 @@ class VideoPlayerApp:
 
         保留同名薄封装，三个调用点（update_frame / change_display_mode /
         _refresh_paused_frame）就一行都不用改。
+
+        【第 25 轮】多传一个 `source_half`：源是半宽 SBS 时，合成前每半要先
+        横向拉回 2 倍（理由见 depth3d.process_3d）。开关就是底栏那个勾选框。
         """
         return depth3d.process_3d(frame, self.display_mode, self.swap_eyes,
-                                  self.parallax_value, self._mesh)
+                                  self.parallax_value, self._mesh,
+                                  source_half=self.half_sbs)
 
     def _refresh_paused_frame(self):
         """暂停状态下按当前设置重算并重绘一帧。

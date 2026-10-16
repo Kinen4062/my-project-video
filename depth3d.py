@@ -38,7 +38,7 @@ class MeshCache:
         return self._x, self._y
 
 
-def process_3d(frame, display_mode, swap_eyes, parallax, mesh):
+def process_3d(frame, display_mode, swap_eyes, parallax, mesh, source_half=False):
     """把 SBS 原始帧处理成当前显示模式的帧。
 
     frame         —— BGR 的左右分屏原始帧
@@ -46,9 +46,12 @@ def process_3d(frame, display_mode, swap_eyes, parallax, mesh):
     swap_eyes     —— 是否交换左右眼
     parallax      —— 视差偏移量（0 表示不做 remap）
     mesh          —— MeshCache 实例（只有需要视差调节时才会被用到）
+    source_half   —— 源是**半宽 SBS**（第 25 轮）：每一半被横向压过一半，
+                     合成前要先拉回 2 倍，否则出来的是"扁的"画面。
 
     2D 模式直接返回原帧（连左右切片都不做）—— 这一点很重要，
     `_sync_parallax_visibility` 的注释里说明过：视差滑块在 2D 下本来就不显示。
+    半宽 SBS 也正靠这一点：2D 模式下两份压扁的画面并排铺满整屏，那正是它该有的样子。
     """
     if display_mode == "2D":
         return frame
@@ -72,6 +75,19 @@ def process_3d(frame, display_mode, swap_eyes, parallax, mesh):
     right_eye = (cv2.resize(right_eye, (w_half, h)) if right_eye.shape[1] != w_half
                  else np.ascontiguousarray(right_eye))
 
+    # 【第 25 轮】半宽 SBS：每一半是"横向压了一半"的（半幅宽 = 整幅的 1/2，
+    # 但它代表的是一只眼的完整画面），所以要先拉回整幅宽度 w 才是正常比例。
+    #
+    # 为什么必须在这里拉（而不是在 3D 合成之后统一拉）：合成之后的画面只有一个
+    # 坐标系，"另一只眼"已经没了；而且 swap_eyes / 视差这两步都是按"一只眼
+    # 的完整画面"定义的 —— 先拉回来，它们才在同一个尺度上工作。
+    #
+    # 2D 模式走不到这里（上面就 return 了），所以并排显示时看到的仍是压扁的
+    # 两份 —— 那是半宽 SBS 的本来面貌，不是 bug。
+    if source_half:
+        left_eye = cv2.resize(left_eye, (w, h), interpolation=cv2.INTER_LINEAR)
+        right_eye = cv2.resize(right_eye, (w, h), interpolation=cv2.INTER_LINEAR)
+
     # 【新增】交换左右眼
     if swap_eyes:
         left_eye, right_eye = right_eye, left_eye
@@ -79,7 +95,9 @@ def process_3d(frame, display_mode, swap_eyes, parallax, mesh):
     # 【新增】实时视差调节
     extra = parallax
     if extra != 0:
-        x_base, y_base = mesh.get(h, w_half)
+        # 眼画面的宽度取实际值而不是写死 w_half —— 半宽 SBS 上一步已经把它拉成 w 了。
+        # MeshCache 本来就按 (h, w) 做键，两种宽度它各自缓存一份，不会互相踩。
+        x_base, y_base = mesh.get(h, left_eye.shape[1])
         left_eye = cv2.remap(left_eye, x_base + extra, y_base,
                              cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
         right_eye = cv2.remap(right_eye, x_base - extra, y_base,

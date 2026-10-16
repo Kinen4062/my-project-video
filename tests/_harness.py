@@ -507,8 +507,27 @@ def make_resume_path():
     return path
 
 
+def make_settings_path():
+    """【第 25 轮】用户偏好（半宽 SBS）那份 JSON 的隔离路径。
+
+    比上面两个更要紧的一点：这份文件里存的是**偏好**，而偏好会**改变后续用例
+    量的东西**。套件里按一次 H 键（真机上就是"切换半宽"）如果落到用户真实的
+    settings.json 上，不仅改了用户的设置，接下来几个用例的 3D 合成路径也会
+    跟着变 —— 而且这种串味只在整套跑的时候出现（下次单跑又是绿的）。
+
+    命名规则与上面两个一致：带 pid + 计数器，起手先删同名文件。
+    """
+    path = os.path.join(work_dir("_settings"),
+                        "settings_%d_%d.json" % (os.getpid(), next(_app_counter)))
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return path
+
+
 def load_app(geometry="1000x700", autoplay_next=False, resume_enabled=False,
-             subtitles=False):
+             subtitles=False, half_sbs=False):
     """装载一个 app。
 
     `autoplay_next=False`（默认）会关掉**片尾自动续播** —— 老套件量的是
@@ -540,10 +559,18 @@ def load_app(geometry="1000x700", autoplay_next=False, resume_enabled=False,
     root.geometry(geometry)
     root.update()
     app = fp.VideoPlayerApp(root, playlist_path=make_playlist_path(),
-                            resume_path=make_resume_path())
+                            resume_path=make_resume_path(),
+                            settings_path=make_settings_path())
     app.autoplay_next = autoplay_next
     app.resume_enabled = resume_enabled
     app.subtitle_enabled = subtitles
+    # 【第 25 轮】半宽 SBS 默认**关**（= 第 25 轮之前的行为）。
+    # 老套件里有对 _process_3d 输出的几何断言（合成画面 = 帧宽的一半），
+    # 半宽一开会把它们整体带偏；半宽自己的用例显式传 True。
+    # 两处都设：`half_sbs` 是代码读的属性，`half_sbs_var` 是勾选框的 variable，
+    # 只改一个会让"界面显示"和"实际行为"对不上。
+    app.half_sbs = half_sbs
+    app.half_sbs_var.set(half_sbs)
     # 【第 16 轮】关掉"启动后预热列表文件音轨结论"的后台线程（见
     # final_player._warm_audio_probe_cache）。它要起 ffmpeg 子进程，会跟
     # test_playlist.py ⑪ 节那条"连续切换 <150ms"的断言抢磁盘和 CPU，让耗时
@@ -603,17 +630,18 @@ def teardown(root, app):
 
 
 def run_suite(title, body, autoplay_next=False, resume_enabled=False,
-              subtitles=False):
+              subtitles=False, half_sbs=False):
     """套件统一入口：装载 → 跑 body(root, app, fp, summary) → 收尾 → 返回退出码
 
     `autoplay_next` 见 `load_app` 的说明（默认关，播放列表套件传 True）。
     `resume_enabled` 同（默认关，test_resume.py 传 True）。
     `subtitles` 同（默认关，test_subtitles.py 传 True）。
+    `half_sbs` 同（默认关，test_half_sbs.py 自己逐节切，因为要**两边都验**）。
     """
     summary = Summary(title)
     root, app, fp = load_app(autoplay_next=autoplay_next,
                              resume_enabled=resume_enabled,
-                             subtitles=subtitles)
+                             subtitles=subtitles, half_sbs=half_sbs)
     try:
         body(root, app, fp, summary)
     finally:
