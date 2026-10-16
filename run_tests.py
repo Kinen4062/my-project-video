@@ -40,7 +40,7 @@ TMP_ROOT = os.path.join(os.environ.get("TEMP", "/tmp"), "fp_tests")
 # 语法检查只读源码、在内存里编译 —— 不写 __pycache__（见文件头第 1 条）
 SYNTAX_TARGETS = ("final_player.py", "media_tools.py", "depth3d.py", "viewfit.py",
                   "filedrop.py", "playlist_store.py", "resume_store.py",
-                  "subtitle.py", "subtitle_online.py")
+                  "subtitle.py", "subtitle_online.py", "build_exe.py")
 SYNTAX_CHECK_CODE = (
     "import sys\n"
     "for p in sys.argv[1:]:\n"
@@ -102,6 +102,7 @@ def build_plan(full=False, quick=False):
         ("音轨探测", [os.path.join(TESTS, "test_audio_probe.py")]),
         ("转换补音轨", [os.path.join(TESTS, "test_audio_mux.py")]),
         ("稳态速度", [os.path.join(TESTS, "test_speed.py")]),
+        ("打包成 exe", [os.path.join(TESTS, "test_packaging.py")]),
     ]
     for seed in range(1, seeds + 1):
         plan.append(("乱序压力 seed=%d" % seed,

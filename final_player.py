@@ -6,6 +6,52 @@ import uuid      # 【P1】每次转换生成唯一临时文件名，避免互�
 
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
+# ============================================================
+# 【第 24 轮·打包】冻结态（PyInstaller）下的两条启动垫片
+# ------------------------------------------------------------
+# 整段只在 `sys.frozen` 为真时才生效 —— 平时跑源码、跑回归套件时一个字节都
+# 不执行，所以"打包不改变行为"这件事是结构性成立的，不是靠自觉。
+#
+# ① stdout / stderr 兜底
+#    --windowed 打包出来的程序没有控制台，PyInstaller 会把 sys.stdout 和
+#    sys.stderr 置成 None。本文件里（以及 transformers、tqdm 这些库内部）
+#    有大量 print()，往 None 上 write 就是
+#        AttributeError: 'NoneType' object has no attribute 'write'
+#    而且发生在**启动阶段**，表现成"双击一下闪一下就没了"，极难查。
+#    兜到一个日志文件里而不是 devnull —— 程序是发给别人的，出了事总得有
+#    东西可看。位置跟着 playlist_store / resume_store 的老约定走
+#    （%APPDATA%/final_player/），buffering=1 是**行缓冲**：SDL 那边要是
+#    真段错误了，最后几行也必须已经落盘，否则日志等于没有。
+#    日志文件建不出来（只读配置目录、权限受限）就退回 devnull，绝不因此崩。
+#
+# ② HF_HUB_CACHE
+#    深度模型随包走（见 build_exe.py 的 --add-data），缓存目录就在包内。
+#    指过去，`_load_depth_model()` 的第一跳（local_files_only=True）才能
+#    在**别人机器上**（那里没有 ~/.cache/huggingface）命中。
+#    目录不存在就不设这个变量 —— 保持"没带模型就联网下载"的老行为。
+# ============================================================
+if getattr(sys, "frozen", False):
+    _BUNDLE_DIR = getattr(sys, "_MEIPASS",
+                          os.path.dirname(os.path.abspath(sys.executable)))
+
+    if sys.stdout is None or sys.stderr is None:
+        try:
+            _cfg_dir = os.path.join(
+                os.environ.get("APPDATA") or os.path.expanduser("~"), "final_player")
+            os.makedirs(_cfg_dir, exist_ok=True)
+            _log_stream = open(os.path.join(_cfg_dir, "player.log"), "a",
+                               encoding="utf-8", errors="replace", buffering=1)
+        except Exception:
+            _log_stream = open(os.devnull, "w")
+        if sys.stdout is None:
+            sys.stdout = _log_stream
+        if sys.stderr is None:
+            sys.stderr = _log_stream
+
+    _BUNDLED_HF_CACHE = os.path.join(_BUNDLE_DIR, "hf_cache")
+    if os.path.isdir(_BUNDLED_HF_CACHE):
+        os.environ["HF_HUB_CACHE"] = _BUNDLED_HF_CACHE
+
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 import cv2
@@ -493,6 +539,73 @@ def find_ffmpeg():
             continue
     _FFMPEG_PATH = ""
     return None
+
+
+def _run_selftest():
+    """【第 24 轮·打包】把打包后"最容易坏、又最难发现"的两件事各验一遍。
+
+    为什么需要它：程序是发给别人的，出了问题对方能给你的只有一句"不能用了"。
+    而这两件事都是**静默**失效的 ——
+      · 找不到 ffmpeg：转换照跑，只是产物**没有声音**，界面上一个错都不报；
+      · 模型缓存对不上：要到点【转换为3d】才报错，而那一步用户已经等了几分钟。
+    有了自检，对方跑 `final_player.exe --selftest` 再把 player.log 发过来，
+    就能直接定位。
+
+    输出**同时走两条路**，缺一不可：
+      · 打在屏幕上 —— 从命令行启动时能看到（多数人直接复制贴给你）；
+      · 追加进 %APPDATA%/final_player/player.log —— **双击**启动没有屏幕可打；
+        而且从命令行跑时中文经控制台代码页可能变成乱码，日志文件固定 UTF-8。
+    第 24 轮实测：--windowed 的程序从终端启动时 sys.stdout 是**有效的**，
+    只有双击（没有控制台）时才为 None。所以只做一条路的方案必然漏一种情况。
+
+    顺序也是刻意的：先把"不依赖 transformers 就能得出的结论"打出去，再去碰
+    transformers。否则它要是坏在 import 那一步（这正是要诊断的故障之一），
+    报告会一个字都留不下来。
+    """
+    lines = []
+
+    def emit(text=""):
+        lines.append(text)
+        print(text)
+
+    frozen = getattr(sys, "frozen", False)
+    emit("=" * 62)
+    emit("自检报告（%s）" % ("打包运行" if frozen else "源码运行"))
+    emit("  sys.frozen   = %s" % frozen)
+    emit("  sys._MEIPASS = %s" % getattr(sys, "_MEIPASS", "(无，非冻结态)"))
+    emit("-" * 62)
+
+    ffmpeg = find_ffmpeg()
+    emit("  ffmpeg       : %s"
+         % (ffmpeg or "**找不到** —— 转换出来的 3D 视频会没有声音（不会报错）"))
+    emit("  模型缓存目录 : %s" % os.environ.get("HF_HUB_CACHE", "(用默认缓存目录)"))
+
+    model_id = "depth-anything/Depth-Anything-V2-Small-hf"
+    try:
+        from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+        AutoImageProcessor.from_pretrained(model_id, local_files_only=True)
+        AutoModelForDepthEstimation.from_pretrained(model_id, local_files_only=True)
+        emit("  深度模型     : 本地齐全，可以离线转换")
+    except Exception as exc:
+        emit("  深度模型     : 本地不可用（%s: %s）" % (type(exc).__name__, exc))
+        emit("                 第一次点【转换为3d】会尝试联网下载。")
+    emit("=" * 62)
+
+    try:
+        cfg_dir = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
+                               "final_player")
+        os.makedirs(cfg_dir, exist_ok=True)
+        with open(os.path.join(cfg_dir, "player.log"), "a",
+                  encoding="utf-8", errors="replace") as fh:
+            fh.write("\n".join(lines) + "\n")
+    except Exception as exc:            # 写不了日志也不能让自检本身失败
+        print("（自检报告写入日志失败：%s）" % exc)
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None:
+                stream.flush()
+        except Exception:
+            pass
 
 
 def format_hms(seconds):
@@ -5501,6 +5614,13 @@ class VideoPlayerApp:
         self.root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
 
 if __name__ == "__main__":
+    # 【第 24 轮·打包】自检入口。打包后发给别人，出问题时让对方在
+    # 命令行里跑 `final_player.exe --selftest`，结论写进
+    # %APPDATA%/final_player/player.log（--windowed 没有控制台）。
+    if "--selftest" in sys.argv:
+        _run_selftest()
+        sys.exit(0)
+
     root = tk.Tk()
     app = VideoPlayerApp(root)
     root.mainloop()
